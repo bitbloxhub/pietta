@@ -1,0 +1,38 @@
+{
+	"name": "pietta",
+	"version": "0.1.0",
+	"description": "Git-backed memory extension for Pi",
+	"type": "module",
+	"packageManager": "pnpm@10.33.0",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"memory"
+	],
+	"scripts": {
+		"check": "tsc --noEmit",
+		"check:format": "prettier --check .",
+		"dev": "pnpm exec tsc --noEmit --watch",
+		"format": "prettier --write ."
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-ai": "*",
+		"@mariozechner/pi-coding-agent": "*",
+		"@mariozechner/pi-tui": "*",
+		"@sinclair/typebox": "*"
+	},
+	"devDependencies": {
+		"@mariozechner/pi-ai": "^0.62.0",
+		"@mariozechner/pi-coding-agent": "^0.62.0",
+		"@mariozechner/pi-tui": "^0.62.0",
+		"@sinclair/typebox": "^0.34.48",
+		"@types/node": "^25.5.0",
+		"prettier": "^3.6.2",
+		"typescript": "^6.0.2"
+	}
+}
