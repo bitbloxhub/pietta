@@ -557,11 +557,16 @@ export async function commitWorktreeChanges(
 	}
 	if (!(await hasGitChanges(pi, workTree))) return
 	await ensureGitIdentity(pi, workTree)
-	await gitOrThrow(
-		pi,
-		["commit", "-m", message],
-		`Failed to commit memory changes in ${workTree}`,
-		{ cwd: workTree },
+	const result = await git(pi, ["commit", "-m", message], { cwd: workTree })
+	if (result.code === 0) return
+	const output = `${result.stderr}\n${result.stdout}`
+	if (/nothing to commit|working tree clean/i.test(output)) return
+	throw new Error(
+		getGitFailureMessage(
+			`Failed to commit memory changes in ${workTree}`,
+			["commit", "-m", message],
+			result,
+		),
 	)
 }
 

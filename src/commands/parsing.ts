@@ -9,6 +9,7 @@ import {
 	SCOPE_VALUES,
 	type AgentsArgs,
 	type MemoryArgs,
+	type RememberArgs,
 	type Scope,
 } from "../core/types.js"
 
@@ -116,16 +117,44 @@ export function parseAgentsArgs(args: string): AgentsArgs {
 	return { command, value: rest.join(" ") || undefined }
 }
 
-export function parseRememberArgs(args: string): {
-	scope: Scope
-	text: string
-} {
+export function parseRememberArgs(args: string): RememberArgs {
 	const trimmed = args.trim()
-	if (!trimmed) return { scope: "project", text: "" }
-	const [first, ...rest] = trimmed.split(/\s+/)
-	if ((SCOPE_VALUES as readonly string[]).includes(first))
-		return { scope: first as Scope, text: rest.join(" ") }
-	return { scope: "project", text: trimmed }
+	if (!trimmed)
+		return { scope: "project", scopeExplicit: false, path: undefined, text: "" }
+
+	const parts = trimmed.split(/\s+/).filter(Boolean)
+	let scope: Scope = "project"
+	let scopeExplicit = false
+	const textParts: string[] = []
+	let pathValue: string | undefined
+	for (const [index, part] of parts.entries()) {
+		if (!scopeExplicit) {
+			if (index === 0 && (SCOPE_VALUES as readonly string[]).includes(part)) {
+				scope = part as Scope
+				scopeExplicit = true
+				continue
+			}
+			if (part.startsWith("scope=")) {
+				const scopeValue = part.slice(6)
+				if ((SCOPE_VALUES as readonly string[]).includes(scopeValue)) {
+					scope = scopeValue as Scope
+					scopeExplicit = true
+					continue
+				}
+			}
+		}
+		if (!pathValue && part.startsWith("path=")) {
+			pathValue = part.slice(5) || undefined
+			continue
+		}
+		textParts.push(part)
+	}
+	return {
+		scope,
+		scopeExplicit,
+		path: pathValue,
+		text: textParts.join(" "),
+	}
 }
 
 export function parseMemoryArgs(args: string): MemoryArgs {

@@ -14,42 +14,48 @@ Pietta gives each agent its own local memory repo and organizes durable memory i
 - creates a dedicated memory repo per agent under `~/.pi/pietta/agents/<agent-id>/`
 - stores durable memory as normal files instead of an opaque database
 - separates memory into `project`, `agent`, and `session` scopes
-- keeps project summaries, decisions, scratchpads, timelines, and rule folders
+- keeps a simple top-level hierarchy of system, projects, sessions, rules, per-project timelines, and maintenance files
 - injects lightweight Pietta context before the agent starts
 - exposes slash commands and tools for remembering, grepping, updating, and deleting memory
 
 ## Current storage layout
 
-For an agent named `default`, Pietta creates:
+For an agent named `default`, Pietta now prefers a simpler top-level hierarchy:
 
 ```text
 ~/.pi/pietta/agents/default/
 ├── memory.git/
 └── memory/
     ├── README.md
-    ├── profile/
-    │   ├── preferences.md
-    │   ├── environment.md
-    │   └── habits.md
+    ├── system/
+    │   ├── README.md
+    │   └── <agent-chosen-files-and-subdirs>
     ├── projects/
     │   └── <project-slug>/
-    │       ├── SUMMARY.md
-    │       ├── decisions.md
-    │       ├── timeline.jsonl
-    │       ├── scratchpad.md
-    │       └── facts/
-    ├── agent/
+    │       ├── README.md
+    │       ├── system/
+    │       │   └── <agent-chosen-files-and-subdirs>
+    │       ├── rules/
+    │       └── timeline.jsonl
     ├── sessions/
     │   └── memory/
     ├── summaries/
     │   └── latest.md
     ├── inbox/
     │   └── candidates.jsonl
-    └── rules/
-        ├── project/
-        ├── agent/
-        └── generated/
+    ├── rules/
+    │   ├── agent/
+    │   └── generated/
+    └── archive/
 ```
+
+Notes:
+
+- Pietta does **not** prescribe fixed subfolders inside `system/`
+- Pietta does **not** prescribe fixed subfolders inside `projects/<slug>/`
+- the agent can organize both `system/` and project memory however it decides
+- each project also has a `projects/<slug>/system/` area for project-pinned memory
+- no generic `/init` command is introduced; `/pietta-init` remains canonical
 
 ## Project model
 
@@ -61,26 +67,38 @@ Example:
 - project slug: `pietta`
 - project memory dir: `projects/pietta/`
 
-Project-scoped durable memories are written into:
+Project-scoped durable memories default to the project root and supporting subpaths under:
 
 ```text
-projects/<project-slug>/facts/
+projects/<project-slug>/
+```
+
+Project-scoped rules, conventions, and stable preferences should generally live under:
+
+```text
+projects/<project-slug>/system/
+```
+
+Ordinary project facts can live directly under:
+
+```text
+projects/<project-slug>/
 ```
 
 This means Pietta is project-aware, but projects are not yet first-class objects with their own metadata model beyond the directory layout.
+
+By default, project remembers now prefer `projects/<slug>/system/` for high-priority project rules/conventions/preferences and `projects/<slug>/` for ordinary project facts, unless the agent explicitly chooses a subpath.
 
 ## Rules model
 
 Rules are plain markdown files stored in:
 
-- `rules/project/`
-- `rules/agent/`
-- `rules/generated/`
+- `projects/<slug>/rules/` for project rules
+- `rules/agent/` for agent rules
+- `rules/generated/` for generated rules
 
 Right now, rules are:
 
-- created as folders with README stubs during init
-- listed by the `/rules` command
 - searchable through Pietta grep
 - referenced in injected context by file path
 
@@ -102,41 +120,45 @@ Duplicate names get numeric suffixes like `_2`.
 
 ## What gets injected before agent start
 
-Pietta injects a hidden context block that currently includes:
+Pietta injects a hidden context block that now emphasizes hierarchy:
 
 - the current agent id
 - the memory root path
 - memory discipline guidance
+- the active hierarchy roots (`system/`, project, project system, session, rules, inbox)
 - the current project summary, if present
 - the latest summary, if present
+- pinned `system/` and project system memory snippets when available
 - a list of available rule file paths, if present
+- a lightweight tree view of pinned system memory
 
-It does **not** automatically inject all memory files or rule contents.
+It still does **not** automatically inject the full contents of every memory file.
 
 ## Search behavior
 
 Pietta grep is designed to work like ripgrep.
 
-Current grep scope is limited to the active project and non-project shared agent areas:
+Current grep scope is limited to the active project and shared agent areas for the current agent:
 
-- current `projectDir`
-- `profileDir`
-- `agentNotesDir`
+- current `projectDir` (including `projects/<slug>/rules/`)
+- pinned `system/` and `projects/<slug>/system/` memory
+- shared `rulesDir` (`rules/agent/` and `rules/generated/`)
 - `sessionMemoryDir`
-- `rulesDir`
 - `summariesDir`
 - `inboxDir`
-
-It deliberately does **not** grep other projects in the same agent repo.
 
 ## Slash commands
 
 Current command surface:
 
-- `/pietta-init` — initialize Pietta for the current or selected agent
+- `/pietta-init` — initialize or re-analyze Pietta for the current or selected agent
+  - ensures the Pietta layout exists for the selected agent
+  - sends a Letta-style user message so the agent can inspect the project and update memory through Pietta tools
 - `/agent` — switch the active Pietta agent
 - `/pietta-doctor` — audit and repair memory layout
-- `/remember` — store a durable memory item
+- `/remember` — promote a durable lesson, preference, rule, or fact into the right hierarchy
+  - sends a Letta-style user message so the agent can infer, rewrite, and store the right durable memory from context
+  - explicit scope and `path=subdir/file_name` are passed through as strong placement hints for the agent to follow
 - `/memory list`
 - `/memory recent`
 - `/memory show <id>`
@@ -148,8 +170,6 @@ Current command surface:
 - `/memory worktrees`
 - `/memory worktree-add <name>`
 - `/memory worktree-remove <name>`
-
-- `/rules` — list rule files
 - `/agents` — list, add, or switch agents
 
 ## Registered tools
@@ -230,18 +250,20 @@ Pietta is currently an early file-first implementation of the original plan in `
 
 Implemented now:
 
-- per-agent git-backed repo layout
+- Letta-inspired `system/` vs project hierarchy
 - real git commits for memory writes, updates, and deletes
 - automatic per-session worktrees for concurrent mutations
 - attached worktree visibility in `/pietta-doctor`
 - scoped durable memory writing
+- hierarchy-aware remember placement for pinned agent memory
 - meaningful memory filenames
 - memory grep
-- project summaries and rule directories
-- lightweight context injection
+- simple top-level hierarchy without prescribed subfolders inside `system/` or `projects/<slug>/`
+- lightweight context injection with pinned system snippets
 
 Not implemented yet:
 
+- richer multi-step interactive `/pietta-init` interviews beyond the current user-message-driven init flow
 - smart rule selection and just-in-time rule content injection
 - cross-project or cross-agent sync
 - semantic retrieval or embeddings

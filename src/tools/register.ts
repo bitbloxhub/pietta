@@ -70,14 +70,17 @@ export function registerTools(
 		name: "pietta_write_memory",
 		label: "Pietta Write Memory",
 		description:
-			"Write durable memory entries into the Pietta agent memory repo",
+			"Write durable memory entries into the Pietta agent memory repo, preferring pinned system areas for agent memory and project system areas for high-priority project memory. Split distinct topics into multiple focused memories, and keep each memory to roughly a paragraph or two when possible",
 		promptSnippet:
-			"Store durable memory aggressively, especially explicit user preferences and recurring constraints",
+			"Store durable memory aggressively, especially explicit user preferences, recurring constraints, and stable workflow notes in pinned system memory or project system memory when appropriate. If you pass `path`, make it a memory-local subpath like `preferences/coding_preferences`, not a full repo path like `projects/<slug>/README.md`",
 		promptGuidelines: [
 			"Always write durable memory when the user explicitly states a preference, default, recurring workflow, or standing constraint.",
 			"Do not wait for the user to ask to remember it if the preference is stated clearly.",
 			"Use this only for durable facts, preferences, rules, decisions, and environment constraints.",
 			"Do not store speculative assumptions, temporary plans, secrets, or credentials.",
+			"For project-scoped memories, prefer project system memory for durable project rules and conventions, and ordinary project memory for normal facts.",
+			"If you provide `path`, it must be a slash-separated path relative to the chosen memory area, without `.md`, and not a full repo path.",
+			"Do not target scaffold files like `README.md` in `projects/<slug>/`, `system/`, or `rules/`; create or update real memory files instead.",
 		],
 		parameters: Type.Object({
 			text: Type.String({ description: "The durable memory text to store" }),
@@ -95,6 +98,12 @@ export function registerTools(
 			source: Type.Optional(
 				Type.String({ description: "Optional provenance source" }),
 			),
+			path: Type.Optional(
+				Type.String({
+					description:
+						"Optional slash-separated memory-local subpath like `preferences/coding_preferences`; do not pass full repo paths such as `projects/<slug>/README.md` or include `.md`",
+				}),
+			),
 			agentId: Type.Optional(
 				Type.String({ description: "Optional agent ID override" }),
 			),
@@ -108,6 +117,7 @@ export function registerTools(
 				kind: params.kind?.trim() || "fact",
 				confidence: params.confidence ?? 0.9,
 				source: params.source,
+				path: params.path,
 			})
 			return {
 				content: [{ type: "text", text: `Stored memory in ${filePath}` }],
@@ -121,13 +131,19 @@ export function registerTools(
 		label: "Pietta Update Memory",
 		description:
 			"Update an existing Pietta memory item and refresh its updated_at field",
-		promptSnippet: "Update an existing Pietta memory entry by id or path",
+		promptSnippet:
+			"Update an existing Pietta memory entry by its memory id. If you use a filename or path instead of an id, include the `.md` extension. Prefer ids returned by list/show/grep results, not guessed repo paths or scaffold README files",
 		promptGuidelines: [
 			"Use this when the user wants to revise or correct an existing durable memory item.",
+			"Prefer the exact memory id from Pietta output, such as `project/user_preferences`.",
+			"If you use a filename or full path selector instead of an id, include the `.md` extension.",
+			"Do not guess selectors from repo layout. Avoid paths like `projects/<slug>/README.md`, which are scaffold or summary files rather than normal memory items.",
+			"If you are not sure which item to update, grep or list first, then use the returned id.",
 		],
 		parameters: Type.Object({
 			selector: Type.String({
-				description: "Memory id, filename, or full path",
+				description:
+					"Memory id preferred; filename or full path only when you already know it points to a real memory item, and those path-based selectors should include the `.md` extension. Do not use scaffold paths like `projects/<slug>/README.md`",
 			}),
 			text: Type.String({ description: "New body text for the memory item" }),
 			mode: Type.Optional(
@@ -178,13 +194,19 @@ export function registerTools(
 		label: "Pietta Delete Memory",
 		description:
 			"Delete an existing Pietta memory item and log the deletion in jsonl timelines",
-		promptSnippet: "Delete an existing Pietta memory entry by id or path",
+		promptSnippet:
+			"Delete an existing Pietta memory entry by its memory id. If you use a filename or path instead of an id, include the `.md` extension. Prefer ids from Pietta results, not guessed repo paths or scaffold README files",
 		promptGuidelines: [
 			"Use this when the user explicitly wants a memory item forgotten or removed.",
+			"Prefer the exact memory id from Pietta output.",
+			"If you use a filename or full path selector instead of an id, include the `.md` extension.",
+			"Do not guess selectors from repo layout or use scaffold files like `projects/<slug>/README.md`.",
+			"If you are unsure which item to delete, grep or list first, then delete by id.",
 		],
 		parameters: Type.Object({
 			selector: Type.String({
-				description: "Memory id, filename, or full path",
+				description:
+					"Memory id preferred; filename or full path only when you already know it points to a real memory item, and those path-based selectors should include the `.md` extension. Do not use scaffold paths like `projects/<slug>/README.md`",
 			}),
 			agentId: Type.Optional(
 				Type.String({ description: "Optional agent ID override" }),

@@ -4,6 +4,7 @@ import {
 	readFile,
 	stat,
 	unlink,
+	mkdir,
 	writeFile,
 } from "node:fs/promises"
 import { existsSync, readFileSync, readdirSync } from "node:fs"
@@ -37,18 +38,94 @@ import {
 } from "./paths.js"
 import type { MemoryItem, MemoryPaths, RememberInput, Scope } from "./types.js"
 
+export const EMPTY_LATEST_SUMMARY =
+	"# Latest Summary\n\nNo generated summary yet."
+
+function uniquePaths(pathsList: string[]): string[] {
+	return [...new Set(pathsList)]
+}
+
+const mutationQueues = new Map<string, Promise<void>>()
+
+async function withAgentMutationLock<T>(
+	agentId: string,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const previous = mutationQueues.get(agentId) ?? Promise.resolve()
+	let release!: () => void
+	const current = new Promise<void>((resolve) => {
+		release = resolve
+	})
+	const queued = previous.catch(() => undefined).then(() => current)
+	mutationQueues.set(agentId, queued)
+	await previous.catch(() => undefined)
+	try {
+		return await operation()
+	} finally {
+		release()
+		if (mutationQueues.get(agentId) === queued) mutationQueues.delete(agentId)
+	}
+}
+
+export function getRuleRoots(paths: MemoryPaths): string[] {
+	return uniquePaths([paths.projectRulesDir, paths.rulesDir])
+}
+
+export function getPinnedSystemRoots(paths: MemoryPaths): string[] {
+	return uniquePaths([paths.systemDir, paths.projectSystemDir])
+}
 export function getMemoryRoots(
 	paths: MemoryPaths,
 ): Array<{ scope: Scope; dir: string }> {
-	return [
-		{ scope: "project", dir: paths.projectFactsDir },
-		{ scope: "agent", dir: paths.agentNotesDir },
+	const roots: Array<{ scope: Scope; dir: string }> = [
+		{ scope: "project", dir: paths.projectDir },
+		{ scope: "agent", dir: paths.systemDir },
 		{ scope: "session", dir: paths.sessionMemoryDir },
 	]
+	return roots
+}
+function isUnderDir(filePath: string, dir: string): boolean {
+	const relativePath = path.relative(dir, filePath)
+	return (
+		relativePath !== "" &&
+		!relativePath.startsWith("..") &&
+		!path.isAbsolute(relativePath)
+	)
 }
 
-export function getMemoryItemId(scope: Scope, filePath: string): string {
-	return `${scope}/${path.basename(filePath, ".md")}`
+function isScaffoldMemoryFile(paths: MemoryPaths, filePath: string): boolean {
+	return (
+		filePath === path.join(paths.systemDir, "README.md") ||
+		filePath === path.join(paths.projectSystemDir, "README.md") ||
+		filePath === paths.projectSummaryFile ||
+		filePath === path.join(paths.projectRulesDir, "README.md") ||
+		filePath === path.join(paths.agentRulesDir, "README.md") ||
+		filePath === path.join(paths.generatedRulesDir, "README.md")
+	)
+}
+export function isListedMemoryFile(
+	paths: MemoryPaths,
+	filePath: string,
+): boolean {
+	if (filePath === paths.projectSummaryFile) return false
+	if (!filePath.endsWith(".md")) return false
+	if (isScaffoldMemoryFile(paths, filePath)) return false
+	if (isUnderDir(filePath, paths.projectSystemDir)) return false
+	if (isUnderDir(filePath, paths.projectRulesDir)) return false
+	if (isUnderDir(filePath, paths.agentRulesDir)) return false
+	if (isUnderDir(filePath, paths.generatedRulesDir)) return false
+	return true
+}
+
+export function getMemoryItemId(
+	scope: Scope,
+	filePath: string,
+	rootDir?: string,
+): string {
+	const relativePath = rootDir
+		? path.relative(rootDir, filePath).replace(/\\/g, "/")
+		: path.basename(filePath)
+	return `${scope}/${relativePath.replace(/\.md$/i, "")}`
 }
 
 export function frontmatter(
@@ -96,17 +173,65 @@ export function parseFrontmatterBlock(content: string): {
 	return { data, body }
 }
 
-export function getRememberDir(paths: MemoryPaths, scope: Scope): string {
-	switch (scope) {
-		case "project":
-			return paths.projectFactsDir
-		case "agent":
-			return paths.agentNotesDir
-		case "session":
-			return paths.sessionMemoryDir
-	}
+export function getRememberDir(
+	paths: MemoryPaths,
+	scope: Scope,
+	kind: string,
+	text: string,
+): string {
+	if (scope === "session") return paths.sessionMemoryDir
+	if (scope === "agent") return paths.systemDir
+	if (scope !== "project") return paths.projectDir
+
+	const signal = `${kind} ${text}`.toLowerCase()
+	if (
+		/(rule|policy|constraint|preference|workflow|convention|guideline|standard|always|never|should|must)/.test(
+			signal,
+		)
+	)
+		return paths.projectSystemDir
+	return paths.projectDir
 }
 
+export function sanitizeMemoryPathSegment(value: string): string {
+	return slugifyMemoryName(value.replace(/\.md$/i, "")).replace(/^_+|_+$/g, "")
+}
+
+export function sanitizeRelativeMemoryPath(value: string): string | null {
+	const parts = value
+		.split(/[\\/]+/)
+		.map((part) => sanitizeMemoryPathSegment(part.trim()))
+		.filter(Boolean)
+	if (parts.length === 0) return null
+	return parts.join("/")
+}
+
+export async function resolveRememberTarget(
+	baseDir: string,
+	preferredStem: string,
+	explicitPath?: string,
+): Promise<{ relativePath: string; filePath: string }> {
+	const sanitizedPath = explicitPath
+		? sanitizeRelativeMemoryPath(explicitPath)
+		: null
+	if (!sanitizedPath) {
+		const stem = await getUniqueMemoryStem(baseDir, preferredStem)
+		return {
+			relativePath: stem,
+			filePath: path.join(baseDir, `${stem}.md`),
+		}
+	}
+
+	const parts = sanitizedPath.split("/")
+	const leaf = parts.pop() || preferredStem
+	const nestedDir = path.join(baseDir, ...parts)
+	const stem = await getUniqueMemoryStem(nestedDir, leaf || preferredStem)
+	const relativePath = [...parts, stem].filter(Boolean).join("/")
+	return {
+		relativePath,
+		filePath: path.join(baseDir, `${relativePath}.md`),
+	}
+}
 export function getMemoryTitle(text: string, kind: string): string {
 	const firstLine = text
 		.split("\n")
@@ -122,7 +247,6 @@ export function getMemoryTitle(text: string, kind: string): string {
 	const words = stem.split("_").filter(Boolean).slice(0, 8)
 	return words.join("_") || `${slugifyMemoryName(kind || "memory")}_entry`
 }
-
 export async function getUniqueMemoryStem(
 	dir: string,
 	preferredStem: string,
@@ -159,6 +283,7 @@ export async function collectMarkdownFiles(
 export async function getRecentFiles(
 	dir: string,
 	limit: number,
+	includeFile?: (filePath: string) => boolean,
 ): Promise<Array<{ file: string; mtimeMs: number }>> {
 	if (!(await exists(dir))) return []
 	const results: Array<{ file: string; mtimeMs: number }> = []
@@ -167,10 +292,11 @@ export async function getRecentFiles(
 		if (entry.name === ".git") continue
 		const fullPath = path.join(dir, entry.name)
 		if (entry.isDirectory()) {
-			results.push(...(await getRecentFiles(fullPath, limit)))
+			results.push(...(await getRecentFiles(fullPath, limit, includeFile)))
 			continue
 		}
 		if (!entry.isFile()) continue
+		if (includeFile && !includeFile(fullPath)) continue
 		const info = await stat(fullPath)
 		results.push({ file: fullPath, mtimeMs: info.mtimeMs })
 	}
@@ -192,12 +318,12 @@ export function getMemoryItemIdsSync(cwd: string, agentId: string): string[] {
 					stack.push(fullPath)
 					continue
 				}
-				if (!entry.isFile() || !entry.name.endsWith(".md")) continue
+				if (!entry.isFile() || !isListedMemoryFile(paths, fullPath)) continue
 				const parsed = parseFrontmatterBlock(readFileSync(fullPath, "utf8"))
 				ids.add(
 					typeof parsed.data.id === "string"
 						? parsed.data.id
-						: getMemoryItemId(scope, fullPath),
+						: getMemoryItemId(scope, fullPath, dir),
 				)
 			}
 		}
@@ -227,20 +353,22 @@ export async function collectMemoryItemsFromPaths(
 	const files = (
 		await Promise.all(
 			getMemoryRoots(paths).map(async ({ scope, dir }) => {
-				const recentFiles = await getRecentFiles(dir, 500)
-				return recentFiles.map((file) => ({ ...file, scope }))
+				const recentFiles = await getRecentFiles(dir, 500, (filePath) =>
+					isListedMemoryFile(paths, filePath),
+				)
+				return recentFiles.map((file) => ({ ...file, scope, rootDir: dir }))
 			}),
 		)
 	).flat()
 	const items: MemoryItem[] = []
 	for (const file of files) {
-		if (!file.file.endsWith(".md")) continue
+		if (!isListedMemoryFile(paths, file.file)) continue
 		const parsed = parseFrontmatterBlock(await readFile(file.file, "utf8"))
 		items.push({
 			id:
 				typeof parsed.data.id === "string"
 					? parsed.data.id
-					: getMemoryItemId(file.scope, file.file),
+					: getMemoryItemId(file.scope, file.file, file.rootDir),
 			filePath: file.file,
 			scope: file.scope,
 			kind: typeof parsed.data.kind === "string" ? parsed.data.kind : "fact",
@@ -305,68 +433,70 @@ export async function remember(
 	agentId: string,
 	input: RememberInput,
 ): Promise<string> {
-	const { paths, worktreeKey, source } = await resolveMutationPaths(
-		pi,
-		ctx,
-		agentId,
-	)
-	const now = new Date().toISOString()
-	const provenanceSource = input.source?.trim() || source
-	const dir = getRememberDir(paths, input.scope)
-	const stem = await getUniqueMemoryStem(
-		dir,
-		getMemoryTitle(input.text, input.kind),
-	)
-	const id = `${input.scope}/${stem}`
-	const filePath = path.join(dir, `${stem}.md`)
-	const content = `${frontmatter({
-		id,
-		scope: input.scope,
-		project: getProjectSlug(ctx.cwd),
-		agent: agentId,
-		kind: input.kind,
-		confidence: input.confidence.toFixed(2),
-		sources: [provenanceSource],
-		created_at: now,
-		updated_at: now,
-	})}\n\n${input.text.trim()}\n`
-	await writeFile(filePath, content, "utf8")
-	await appendTimeline(paths, {
-		id,
-		timestamp: now,
-		action: "remember",
-		agent: agentId,
-		scope: input.scope,
-		kind: input.kind,
-		file: filePath,
-		source: provenanceSource,
+	return withAgentMutationLock(agentId, async () => {
+		const { paths, worktreeKey, source } = await resolveMutationPaths(
+			pi,
+			ctx,
+			agentId,
+		)
+		const now = new Date().toISOString()
+		const provenanceSource = input.source?.trim() || source
+		const dir = getRememberDir(paths, input.scope, input.kind, input.text)
+		const preferredStem = getMemoryTitle(input.text, input.kind)
+		const target = await resolveRememberTarget(dir, preferredStem, input.path)
+		const id = `${input.scope}/${target.relativePath}`
+		const filePath = target.filePath
+		const content = `${frontmatter({
+			id,
+			scope: input.scope,
+			project: getProjectSlug(ctx.cwd),
+			agent: agentId,
+			kind: input.kind,
+			confidence: input.confidence.toFixed(2),
+			sources: [provenanceSource],
+			created_at: now,
+			updated_at: now,
+		})}
+${input.text.trim()}
+`
+		await mkdir(path.dirname(filePath), { recursive: true })
+		await writeFile(filePath, content, "utf8")
+		await appendTimeline(paths, {
+			id,
+			timestamp: now,
+			action: "remember",
+			agent: agentId,
+			scope: input.scope,
+			kind: input.kind,
+			file: filePath,
+			source: provenanceSource,
+		})
+		await appendCandidates(paths, {
+			id,
+			timestamp: now,
+			action: "remember",
+			agent: agentId,
+			scope: input.scope,
+			kind: input.kind,
+			confidence: input.confidence,
+			text: input.text.trim(),
+			file: filePath,
+			source: provenanceSource,
+		})
+		await commitWorktreeChanges(
+			pi,
+			paths.workTree,
+			`feat(memory): remember ${id}`,
+			toWorktreeRelativePaths(paths, [
+				filePath,
+				paths.timelineFile,
+				paths.candidatesFile,
+			]),
+		)
+		await fastForwardCanonicalBranch(pi, paths, worktreeKey)
+		await pushCanonicalBranchToBare(pi, paths)
+		return filePath
 	})
-	await appendCandidates(paths, {
-		id,
-		timestamp: now,
-		action: "remember",
-		agent: agentId,
-		scope: input.scope,
-		kind: input.kind,
-		confidence: input.confidence,
-		text: input.text.trim(),
-		file: filePath,
-		source: provenanceSource,
-	})
-	await commitWorktreeChanges(
-		pi,
-		paths.workTree,
-		`feat(memory): remember ${id}`,
-		toWorktreeRelativePaths(paths, [
-			filePath,
-			paths.timelineFile,
-			paths.candidatesFile,
-		]),
-	)
-	await fastForwardCanonicalBranch(pi, paths, worktreeKey)
-	await pushCanonicalBranchToBare(pi, paths)
-
-	return filePath
 }
 
 export async function updateMemoryItem(
@@ -377,75 +507,80 @@ export async function updateMemoryItem(
 	text: string,
 	options?: { mode?: "replace" | "append"; source?: string },
 ): Promise<MemoryItem> {
-	const { paths, worktreeKey, source } = await resolveMutationPaths(
-		pi,
-		ctx,
-		agentId,
-	)
-	const item = await findMemoryItemInPaths(paths, selector)
-	if (!item) throw new Error(`Could not find memory item: ${selector}`)
-	const now = new Date().toISOString()
-	const provenanceSource = options?.source?.trim() || source
-	const parsed = parseFrontmatterBlock(await readFile(item.filePath, "utf8"))
-	const sources = new Set(
-		Array.isArray(parsed.data.sources) ? parsed.data.sources : [],
-	)
-	sources.add(provenanceSource)
-	const nextBody =
-		options?.mode === "append"
-			? `${parsed.body.trim()}\n\n${text.trim()}`.trim()
-			: text.trim()
-
-	await writeFile(
-		item.filePath,
-		`${frontmatter({
-			id: typeof parsed.data.id === "string" ? parsed.data.id : item.id,
-			scope:
-				typeof parsed.data.scope === "string" ? parsed.data.scope : item.scope,
-			project:
-				typeof parsed.data.project === "string"
-					? parsed.data.project
-					: getProjectSlug(ctx.cwd),
-			agent:
-				typeof parsed.data.agent === "string" ? parsed.data.agent : agentId,
-			kind: typeof parsed.data.kind === "string" ? parsed.data.kind : item.kind,
-			confidence:
-				typeof parsed.data.confidence === "string"
-					? parsed.data.confidence
-					: "0.90",
+	return withAgentMutationLock(agentId, async () => {
+		const { paths, worktreeKey, source } = await resolveMutationPaths(
+			pi,
+			ctx,
+			agentId,
+		)
+		const item = await findMemoryItemInPaths(paths, selector)
+		if (!item) throw new Error(`Could not find memory item: ${selector}`)
+		const now = new Date().toISOString()
+		const provenanceSource = options?.source?.trim() || source
+		const parsed = parseFrontmatterBlock(await readFile(item.filePath, "utf8"))
+		const sources = new Set(
+			Array.isArray(parsed.data.sources) ? parsed.data.sources : [],
+		)
+		sources.add(provenanceSource)
+		const nextBody =
+			options?.mode === "append"
+				? `${parsed.body.trim()}\n\n${text.trim()}`.trim()
+				: text.trim()
+		await writeFile(
+			item.filePath,
+			`${frontmatter({
+				id: typeof parsed.data.id === "string" ? parsed.data.id : item.id,
+				scope:
+					typeof parsed.data.scope === "string"
+						? parsed.data.scope
+						: item.scope,
+				project:
+					typeof parsed.data.project === "string"
+						? parsed.data.project
+						: getProjectSlug(ctx.cwd),
+				agent:
+					typeof parsed.data.agent === "string" ? parsed.data.agent : agentId,
+				kind:
+					typeof parsed.data.kind === "string" ? parsed.data.kind : item.kind,
+				confidence:
+					typeof parsed.data.confidence === "string"
+						? parsed.data.confidence
+						: "0.90",
+				sources: [...sources],
+				created_at:
+					typeof parsed.data.created_at === "string"
+						? parsed.data.created_at
+						: now,
+				updated_at: now,
+			})}
+${nextBody}
+`,
+			"utf8",
+		)
+		await appendTimeline(paths, {
+			id: item.id,
+			timestamp: now,
+			action: "update",
+			agent: agentId,
+			file: item.filePath,
+			mode: options?.mode ?? "replace",
+			source: provenanceSource,
+		})
+		await commitWorktreeChanges(
+			pi,
+			paths.workTree,
+			`docs(memory): update ${item.id}`,
+			toWorktreeRelativePaths(paths, [item.filePath, paths.timelineFile]),
+		)
+		await fastForwardCanonicalBranch(pi, paths, worktreeKey)
+		await pushCanonicalBranchToBare(pi, paths)
+		return {
+			...item,
+			body: nextBody,
+			updatedAt: now,
 			sources: [...sources],
-			created_at:
-				typeof parsed.data.created_at === "string"
-					? parsed.data.created_at
-					: now,
-			updated_at: now,
-		})}\n\n${nextBody}\n`,
-		"utf8",
-	)
-	await appendTimeline(paths, {
-		id: item.id,
-		timestamp: now,
-		action: "update",
-		agent: agentId,
-		file: item.filePath,
-		mode: options?.mode ?? "replace",
-		source: provenanceSource,
+		}
 	})
-	await commitWorktreeChanges(
-		pi,
-		paths.workTree,
-		`docs(memory): update ${item.id}`,
-		toWorktreeRelativePaths(paths, [item.filePath, paths.timelineFile]),
-	)
-	await fastForwardCanonicalBranch(pi, paths, worktreeKey)
-	await pushCanonicalBranchToBare(pi, paths)
-
-	return {
-		...item,
-		body: nextBody,
-		updatedAt: now,
-		sources: [...sources],
-	}
 }
 
 export async function getMemoryHistoryFromPaths(
@@ -490,46 +625,47 @@ export async function deleteMemoryItem(
 	agentId: string,
 	selector: string,
 ): Promise<MemoryItem> {
-	const { paths, worktreeKey, source } = await resolveMutationPaths(
-		pi,
-		ctx,
-		agentId,
-	)
-	const item = await findMemoryItemInPaths(paths, selector)
-	if (!item) throw new Error(`Could not find memory item: ${selector}`)
-	await unlink(item.filePath)
-	const now = new Date().toISOString()
-	const provenanceSource = source
-	await appendTimeline(paths, {
-		id: item.id,
-		timestamp: now,
-		action: "delete",
-		agent: agentId,
-		file: item.filePath,
-		source: provenanceSource,
+	return withAgentMutationLock(agentId, async () => {
+		const { paths, worktreeKey, source } = await resolveMutationPaths(
+			pi,
+			ctx,
+			agentId,
+		)
+		const item = await findMemoryItemInPaths(paths, selector)
+		if (!item) throw new Error(`Could not find memory item: ${selector}`)
+		await unlink(item.filePath)
+		const now = new Date().toISOString()
+		const provenanceSource = source
+		await appendTimeline(paths, {
+			id: item.id,
+			timestamp: now,
+			action: "delete",
+			agent: agentId,
+			file: item.filePath,
+			source: provenanceSource,
+		})
+		await appendCandidates(paths, {
+			id: item.id,
+			timestamp: now,
+			action: "delete",
+			agent: agentId,
+			file: item.filePath,
+			source: provenanceSource,
+		})
+		await commitWorktreeChanges(
+			pi,
+			paths.workTree,
+			`chore(memory): delete ${item.id}`,
+			toWorktreeRelativePaths(paths, [
+				item.filePath,
+				paths.timelineFile,
+				paths.candidatesFile,
+			]),
+		)
+		await fastForwardCanonicalBranch(pi, paths, worktreeKey)
+		await pushCanonicalBranchToBare(pi, paths)
+		return item
 	})
-	await appendCandidates(paths, {
-		id: item.id,
-		timestamp: now,
-		action: "delete",
-		agent: agentId,
-		file: item.filePath,
-		source: provenanceSource,
-	})
-	await commitWorktreeChanges(
-		pi,
-		paths.workTree,
-		`chore(memory): delete ${item.id}`,
-		toWorktreeRelativePaths(paths, [
-			item.filePath,
-			paths.timelineFile,
-			paths.candidatesFile,
-		]),
-	)
-	await fastForwardCanonicalBranch(pi, paths, worktreeKey)
-	await pushCanonicalBranchToBare(pi, paths)
-
-	return item
 }
 
 export function renderMemoryItem(item: MemoryItem): string {
@@ -567,7 +703,11 @@ export async function renderMemoryOverview(
 ): Promise<string> {
 	const { paths } = await ensureAgentLayout(pi, cwd, agentId)
 	const recentFiles = await getRecentFiles(paths.workTree, 8)
-	const rules = await collectMarkdownFiles(paths.rulesDir)
+	const rules = (
+		await Promise.all(
+			getRuleRoots(paths).map((dir) => collectMarkdownFiles(dir)),
+		)
+	).flat()
 	const worktrees = await listMemoryWorktrees(pi, paths)
 	const syncStatus = await renderSyncStatus(pi, paths)
 	return [
@@ -575,6 +715,14 @@ export async function renderMemoryOverview(
 		`Memory root: ${paths.workTree}`,
 		`Canonical worktree: ${getCanonicalWorkTree(paths)}`,
 		`Canonical repo: ${paths.bareRepo}`,
+		"",
+		"Hierarchy:",
+		`- system/ (pinned): ${paths.systemDir}`,
+		`- projects/<slug>/: ${paths.projectDir}`,
+		`- sessions/: ${paths.sessionsDir}`,
+		`- inbox/: ${paths.inboxDir}`,
+		`- archive/: ${paths.archiveDir}`,
+		"",
 		`Project summary: ${paths.projectSummaryFile}`,
 		`Latest summary: ${paths.latestSummaryFile}`,
 		`Rules: ${rules.length}`,
@@ -595,7 +743,6 @@ export async function renderMemoryOverview(
 			: ["- No memory files yet"]),
 	].join("\n")
 }
-
 export async function readFileIfPresent(
 	filePath: string,
 ): Promise<string | null> {
@@ -603,21 +750,38 @@ export async function readFileIfPresent(
 	return readFile(filePath, "utf8")
 }
 
+export async function readFirstPresentFile(
+	filePaths: string[],
+): Promise<string | null> {
+	for (const filePath of uniquePaths(filePaths)) {
+		const content = await readFileIfPresent(filePath)
+		if (content !== null) return content
+	}
+	return null
+}
+
+export async function collectMarkdownFilesFromRoots(
+	roots: string[],
+): Promise<string[]> {
+	const files = (
+		await Promise.all(roots.map((root) => collectMarkdownFiles(root)))
+	).flat()
+	return [...new Set(files)].sort()
+}
 export async function grepMemoryInPaths(
 	pi: ExtensionAPI,
 	paths: MemoryPaths,
 	query: string,
 	limit: number = 30,
 ): Promise<string> {
-	const grepRoots = [
+	const grepRoots = uniquePaths([
 		paths.projectDir,
-		paths.profileDir,
-		paths.agentNotesDir,
-		paths.sessionMemoryDir,
+		paths.systemDir,
 		paths.rulesDir,
+		paths.sessionMemoryDir,
 		paths.summariesDir,
 		paths.inboxDir,
-	]
+	])
 	try {
 		const result = await pi.exec("rg", [
 			"--hidden",
