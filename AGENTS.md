@@ -130,6 +130,37 @@ When editing existing files in this repo:
 - keep command/tool wording aligned with current behavior
 - keep grep terminology consistent: use “grep” for the slash command path and “ripgrep-style” for behavior
 
+## Code layout
+
+Current source layout:
+
+```text
+src/
+	index.ts                 # thin extension entrypoint and event wiring
+	core/
+		context.ts            # injected Pietta context construction
+		git.ts                # git/worktree lifecycle and sync helpers
+		layout.ts             # repo bootstrap, default files, path resolution for reads/writes
+		memory.ts             # memory CRUD, grep, history, rendering helpers
+		paths.ts              # storage roots, slugification, and memory path derivation
+		state.ts              # persisted current-agent state and agent listing helpers
+		types.ts              # shared Pietta types and constants
+	commands/
+		parsing.ts            # slash command parsing and autocomplete helpers
+		register.ts           # slash command registration and handlers
+	tools/
+		register.ts           # tool registration for grep/write/update/delete
+```
+
+Module boundary guidance:
+
+- keep `src/index.ts` as orchestration only
+- keep git/worktree behavior in `src/core/git.ts`
+- keep repo/bootstrap and read/write path setup in `src/core/layout.ts`
+- keep memory file operations and rendering in `src/core/memory.ts`
+- keep slash command parsing/registration out of core modules
+- keep tool registration separate from command registration
+
 ## Good next steps
 
 If you expand this project, the most natural next improvements are:
