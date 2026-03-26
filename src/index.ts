@@ -5,10 +5,17 @@ import {
 	readdir,
 	readFile,
 	stat,
+	rm,
 	unlink,
 	writeFile,
 } from "node:fs/promises"
-import { constants, existsSync, readFileSync, readdirSync } from "node:fs"
+import {
+	constants,
+	existsSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+} from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { StringEnum } from "@mariozechner/pi-ai"
@@ -35,6 +42,7 @@ type MemoryPaths = {
 	agentDir: string
 	bareRepo: string
 	workTree: string
+	worktreesDir: string
 	profileDir: string
 	projectDir: string
 	projectFactsDir: string
@@ -78,8 +86,21 @@ type MemoryItem = {
 const EXTENSION_NAME = "pietta"
 const DEFAULT_AGENT_ID = "default"
 const SCOPE_VALUES = ["project", "agent", "session"] as const
+const WORKTREE_REGISTRATION_RETRIES = 5
+type GitResult = {
+	stdout: string
+	stderr: string
+	code: number
+	killed: boolean
+}
+type SyncConflictStrategy = "ours" | "theirs"
+
 function getStorageRoot(): string {
-	return path.join(homedir(), ".pi", "pietta")
+	try {
+		return path.join(realpathSync(homedir()), ".pi", "pietta")
+	} catch {
+		return path.join(homedir(), ".pi", "pietta")
+	}
 }
 function sanitizeAgentId(value: string): string {
 	return (
@@ -111,11 +132,16 @@ function slugifyMemoryName(value: string): string {
 			.replace(/^_+|_+$/g, "") || "memory_entry"
 	)
 }
-function getPaths(cwd: string, agentId: string): MemoryPaths {
+function getPaths(
+	cwd: string,
+	agentId: string,
+	workTreeOverride?: string,
+): MemoryPaths {
 	const root = getStorageRoot()
 	const agentsDir = path.join(root, "agents")
 	const agentDir = path.join(agentsDir, agentId)
-	const workTree = path.join(agentDir, "memory")
+	const mainWorkTree = path.join(agentDir, "memory")
+	const workTree = workTreeOverride ?? mainWorkTree
 	const projectDir = path.join(workTree, "projects", getProjectSlug(cwd))
 	const rulesDir = path.join(workTree, "rules")
 
@@ -126,6 +152,7 @@ function getPaths(cwd: string, agentId: string): MemoryPaths {
 		agentDir,
 		bareRepo: path.join(agentDir, "memory.git"),
 		workTree,
+		worktreesDir: path.join(agentDir, "worktrees"),
 		profileDir: path.join(workTree, "profile"),
 		projectDir,
 		projectFactsDir: path.join(projectDir, "facts"),
@@ -169,6 +196,786 @@ async function ensureFile(
 	await writeFile(filePath, content, "utf8")
 	created.push(filePath)
 }
+function slugifyWorktreeKey(value: string): string {
+	return slugify(value).replace(/^-+|-+$/g, "") || "main"
+}
+function getSessionWorktreeKey(ctx: ExtensionContext): string {
+	const sessionId = ctx.sessionManager.getSessionId().trim()
+	if (sessionId) return `session_${slugifyWorktreeKey(sessionId)}`
+	const sessionFile = ctx.sessionManager.getSessionFile()
+	if (!sessionFile) return "main"
+	const parsed = path.parse(sessionFile)
+	return `session_${slugifyWorktreeKey(parsed.name || parsed.base || sessionFile)}`
+}
+function getWorktreeBranchName(worktreeKey: string): string | null {
+	if (worktreeKey === "main") return null
+	return `pietta/session/${worktreeKey}`
+}
+function getCanonicalWorkTree(paths: MemoryPaths): string {
+	return path.join(paths.agentDir, "memory")
+}
+async function git(
+	pi: ExtensionAPI,
+	args: string[],
+	options?: { cwd?: string },
+): Promise<GitResult> {
+	return pi.exec("git", args, options)
+}
+function formatGitCommand(args: string[]): string {
+	return `git ${args.join(" ")}`
+}
+function getGitFailureMessage(
+	action: string,
+	args: string[],
+	result: GitResult,
+): string {
+	const details = [result.stderr.trim(), result.stdout.trim()]
+		.filter(Boolean)
+		.join("\n")
+	return [
+		action,
+		`command: ${formatGitCommand(args)}`,
+		`exit_code: ${result.code}`,
+		details || "<no output>",
+	].join("\n")
+}
+async function gitOrThrow(
+	pi: ExtensionAPI,
+	args: string[],
+	action: string,
+	options?: { cwd?: string },
+): Promise<GitResult> {
+	const result = await git(pi, args, options)
+	if (result.code === 0) return result
+	throw new Error(getGitFailureMessage(action, args, result))
+}
+async function ensureGitIdentity(
+	pi: ExtensionAPI,
+	workTree: string,
+): Promise<void> {
+	for (const [key, fallback] of [
+		["user.name", "Pietta"],
+		["user.email", "pietta@local"],
+	] as const) {
+		const current = (
+			await git(pi, ["config", "--get", key], { cwd: workTree }).catch(() => ({
+				stdout: "",
+				stderr: "",
+			}))
+		).stdout.trim()
+		if (current) continue
+		await gitOrThrow(
+			pi,
+			["config", key, fallback],
+			`Failed to configure git identity ${key} for ${workTree}`,
+			{ cwd: workTree },
+		)
+	}
+}
+async function hasGitHead(
+	pi: ExtensionAPI,
+	workTree: string,
+): Promise<boolean> {
+	const result = await git(pi, ["rev-parse", "--verify", "HEAD"], {
+		cwd: workTree,
+	})
+	return result.code === 0
+}
+async function getCurrentBranch(
+	pi: ExtensionAPI,
+	workTree: string,
+): Promise<string> {
+	const result = await git(pi, ["branch", "--show-current"], { cwd: workTree })
+	const branch = result.stdout.trim()
+	if (!branch)
+		throw new Error(`Could not determine current git branch for ${workTree}`)
+	return branch
+}
+function getLocalBranchRef(branch: string): string {
+	return `refs/heads/${branch}`
+}
+async function gitLocalBranchExists(
+	pi: ExtensionAPI,
+	workTree: string,
+	branch: string,
+): Promise<boolean> {
+	const result = await git(
+		pi,
+		["show-ref", "--verify", "--quiet", getLocalBranchRef(branch)],
+		{
+			cwd: workTree,
+		},
+	)
+	return result.code === 0
+}
+async function getHeadCommit(
+	pi: ExtensionAPI,
+	workTree: string,
+): Promise<string> {
+	const result = await gitOrThrow(
+		pi,
+		["rev-parse", "HEAD"],
+		`Failed to resolve HEAD for ${workTree}`,
+		{ cwd: workTree },
+	)
+	return result.stdout.trim()
+}
+async function isAncestorCommit(
+	pi: ExtensionAPI,
+	workTree: string,
+	ancestor: string,
+	descendant: string,
+): Promise<boolean> {
+	const args = ["merge-base", "--is-ancestor", ancestor, descendant]
+	const result = await git(pi, args, { cwd: workTree })
+	if (result.code === 0) return true
+	if (result.code === 1) return false
+	throw new Error(
+		getGitFailureMessage(
+			`Failed to compare git ancestry in ${workTree}`,
+			args,
+			result,
+		),
+	)
+}
+async function listGitRemotes(
+	pi: ExtensionAPI,
+	workTree: string,
+): Promise<string[]> {
+	const result = await gitOrThrow(
+		pi,
+		["remote"],
+		`Failed to list git remotes for ${workTree}`,
+		{ cwd: workTree },
+	)
+	return result.stdout
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean)
+}
+function getRemoteTrackingRef(remote: string, branch: string): string {
+	return `refs/remotes/${remote}/${branch}`
+}
+async function gitRemoteTrackingBranchExists(
+	pi: ExtensionAPI,
+	workTree: string,
+	remote: string,
+	branch: string,
+): Promise<boolean> {
+	const result = await git(
+		pi,
+		["show-ref", "--verify", "--quiet", getRemoteTrackingRef(remote, branch)],
+		{ cwd: workTree },
+	)
+	return result.code === 0
+}
+async function fetchRemoteBranch(
+	pi: ExtensionAPI,
+	workTree: string,
+	remote: string,
+	branch: string,
+): Promise<void> {
+	const args = ["fetch", remote, branch]
+	const result = await git(pi, args, { cwd: workTree })
+	if (
+		result.code !== 0 &&
+		(await gitRemoteTrackingBranchExists(pi, workTree, remote, branch))
+	)
+		throw new Error(
+			getGitFailureMessage(
+				`Failed to fetch ${remote}/${branch} for ${workTree}`,
+				args,
+				result,
+			),
+		)
+}
+async function mergeRemoteTrackingBranch(
+	pi: ExtensionAPI,
+	workTree: string,
+	remote: string,
+	branch: string,
+	strategy: SyncConflictStrategy = "theirs",
+): Promise<void> {
+	if (!(await gitRemoteTrackingBranchExists(pi, workTree, remote, branch)))
+		return
+	const trackingBranch = `${remote}/${branch}`
+	const args = ["merge", "--no-edit", "-X", strategy, trackingBranch]
+	const result = await git(pi, args, { cwd: workTree })
+	if (result.code === 0) return
+	await git(pi, ["merge", "--abort"], { cwd: workTree }).catch(() => ({
+		stdout: "",
+		stderr: "",
+		code: 1,
+		killed: false,
+	}))
+	throw new Error(
+		getGitFailureMessage(
+			`Failed to merge ${trackingBranch} into ${workTree} with -X ${strategy}`,
+			args,
+			result,
+		),
+	)
+}
+async function fetchCanonicalBranchFromGitRemotes(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+): Promise<void> {
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	const canonicalBranch = await getCurrentBranch(pi, canonicalWorkTree)
+	const remotes = await listGitRemotes(pi, canonicalWorkTree)
+	for (const remote of remotes) {
+		await fetchRemoteBranch(pi, canonicalWorkTree, remote, canonicalBranch)
+	}
+}
+async function fastForwardCanonicalBranchFromFetchedOrigin(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+): Promise<void> {
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	const canonicalBranch = await getCurrentBranch(pi, canonicalWorkTree)
+	if (
+		!(await gitRemoteTrackingBranchExists(
+			pi,
+			canonicalWorkTree,
+			"origin",
+			canonicalBranch,
+		))
+	)
+		return
+	const divergence = await getBranchDivergence(
+		pi,
+		canonicalWorkTree,
+		canonicalBranch,
+		`origin/${canonicalBranch}`,
+	)
+	if (!divergence) return
+	if (divergence.ahead > 0) return
+	if (divergence.behind === 0) return
+	await gitOrThrow(
+		pi,
+		["merge", "--ff-only", `origin/${canonicalBranch}`],
+		`Failed to fast-forward canonical memory branch from origin/${canonicalBranch}`,
+		{ cwd: canonicalWorkTree },
+	)
+}
+async function reconcileCanonicalBranchWithGitRemotes(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+): Promise<void> {
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	const canonicalBranch = await getCurrentBranch(pi, canonicalWorkTree)
+	const remotes = await listGitRemotes(pi, canonicalWorkTree)
+	const strategy = await getConflictResolutionStrategy(pi, canonicalWorkTree)
+	await fetchCanonicalBranchFromGitRemotes(pi, paths)
+	for (const remote of remotes) {
+		await mergeRemoteTrackingBranch(
+			pi,
+			canonicalWorkTree,
+			remote,
+			canonicalBranch,
+			strategy,
+		)
+	}
+}
+async function pushCanonicalBranchToRemote(
+	pi: ExtensionAPI,
+	workTree: string,
+	remote: string,
+	branch: string,
+): Promise<void> {
+	const args = ["push", remote, branch]
+	const result = await git(pi, args, { cwd: workTree })
+	if (result.code === 0) return
+	const output = `${result.stderr}\n${result.stdout}`
+	if (!/rejected|fetch first|non-fast-forward/i.test(output))
+		throw new Error(
+			getGitFailureMessage(
+				`Failed to push ${branch} to ${remote}`,
+				args,
+				result,
+			),
+		)
+	const strategy = await getConflictResolutionStrategy(pi, workTree)
+	await fetchRemoteBranch(pi, workTree, remote, branch)
+	await mergeRemoteTrackingBranch(pi, workTree, remote, branch, strategy)
+	await gitOrThrow(
+		pi,
+		args,
+		`Failed to push ${branch} to ${remote} after auto-merging remote changes`,
+		{ cwd: workTree },
+	)
+}
+async function getConflictResolutionStrategy(
+	pi: ExtensionAPI,
+	workTree: string,
+): Promise<SyncConflictStrategy> {
+	const result = await git(pi, ["config", "--get", "pietta.syncStrategy"], {
+		cwd: workTree,
+	})
+	const value = result.stdout.trim()
+	return value === "ours" ? "ours" : "theirs"
+}
+async function setConflictResolutionStrategy(
+	pi: ExtensionAPI,
+	workTree: string,
+	strategy: SyncConflictStrategy,
+): Promise<void> {
+	await gitOrThrow(
+		pi,
+		["config", "pietta.syncStrategy", strategy],
+		`Failed to set Pietta sync strategy to ${strategy} for ${workTree}`,
+		{ cwd: workTree },
+	)
+}
+async function getRemoteUrl(
+	pi: ExtensionAPI,
+	workTree: string,
+	remote: string,
+): Promise<string | null> {
+	const result = await git(pi, ["remote", "get-url", remote], { cwd: workTree })
+	return result.code === 0 ? result.stdout.trim() || null : null
+}
+async function getBranchDivergence(
+	pi: ExtensionAPI,
+	workTree: string,
+	localRef: string,
+	remoteRef: string,
+): Promise<{ ahead: number; behind: number } | null> {
+	const args = [
+		"rev-list",
+		"--left-right",
+		"--count",
+		`${localRef}...${remoteRef}`,
+	]
+	const result = await git(pi, args, { cwd: workTree })
+	if (result.code !== 0) return null
+	const [aheadRaw = "0", behindRaw = "0"] = result.stdout.trim().split(/\s+/)
+	const ahead = Number.parseInt(aheadRaw, 10)
+	const behind = Number.parseInt(behindRaw, 10)
+	return {
+		ahead: Number.isFinite(ahead) ? ahead : 0,
+		behind: Number.isFinite(behind) ? behind : 0,
+	}
+}
+async function renderSyncStatus(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+): Promise<string[]> {
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	const canonicalBranch = await getCurrentBranch(pi, canonicalWorkTree)
+	const strategy = await getConflictResolutionStrategy(pi, canonicalWorkTree)
+	const remotes = await listGitRemotes(pi, canonicalWorkTree)
+	if (remotes.length === 0)
+		return [`Sync strategy: ${strategy}`, "Git remotes: none"]
+	const lines = [
+		`Sync strategy: ${strategy}`,
+		`Git remotes: ${remotes.length}`,
+		"Remote sync status:",
+	]
+	for (const remote of remotes) {
+		const url = await getRemoteUrl(pi, canonicalWorkTree, remote)
+		const trackingExists = await gitRemoteTrackingBranchExists(
+			pi,
+			canonicalWorkTree,
+			remote,
+			canonicalBranch,
+		)
+		if (!trackingExists) {
+			lines.push(
+				`- ${remote}: branch ${canonicalBranch} not found${url ? ` (${url})` : ""}`,
+			)
+			continue
+		}
+		const divergence = await getBranchDivergence(
+			pi,
+			canonicalWorkTree,
+			canonicalBranch,
+			`${remote}/${canonicalBranch}`,
+		)
+		lines.push(
+			`- ${remote}: ahead ${divergence?.ahead ?? 0}, behind ${divergence?.behind ?? 0}${url ? ` (${url})` : ""}`,
+		)
+	}
+	return lines
+}
+
+async function syncWorktreeWithCanonical(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+	worktreeKey: string,
+): Promise<void> {
+	const branch = getWorktreeBranchName(worktreeKey)
+	if (!branch) return
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	const canonicalBranch = await getCurrentBranch(pi, canonicalWorkTree)
+	const hasChanges = await hasGitChanges(pi, paths.workTree)
+	if (hasChanges)
+		throw new Error(
+			`Cannot sync session worktree ${branch} because it has uncommitted changes`,
+		)
+	await reconcileCanonicalBranchWithGitRemotes(pi, paths)
+	await gitOrThrow(
+		pi,
+		["reset", "--hard", canonicalBranch],
+		`Failed to reset session worktree ${branch} onto ${canonicalBranch}`,
+		{ cwd: paths.workTree },
+	)
+	await gitOrThrow(
+		pi,
+		["clean", "-fd"],
+		`Failed to clean session worktree ${branch}`,
+		{ cwd: paths.workTree },
+	)
+	await gitOrThrow(
+		pi,
+		["rebase", canonicalBranch],
+		`Failed to rebase session worktree ${branch} onto ${canonicalBranch}`,
+		{ cwd: paths.workTree },
+	)
+}
+async function fastForwardCanonicalBranch(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+	worktreeKey: string,
+): Promise<void> {
+	const branch = getWorktreeBranchName(worktreeKey)
+	if (!branch) return
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	const canonicalBranch = await getCurrentBranch(pi, canonicalWorkTree)
+	await reconcileCanonicalBranchWithGitRemotes(pi, paths)
+	await gitOrThrow(
+		pi,
+		["rebase", canonicalBranch],
+		`Failed to rebase session worktree ${branch} onto latest ${canonicalBranch}`,
+		{ cwd: paths.workTree },
+	)
+	const canonicalHead = await getHeadCommit(pi, canonicalWorkTree)
+	const sessionHead = await getHeadCommit(pi, paths.workTree)
+	if (
+		!(await isAncestorCommit(pi, canonicalWorkTree, canonicalHead, sessionHead))
+	)
+		throw new Error(
+			`Session worktree ${branch} is not based on canonical branch ${canonicalBranch} after rebase`,
+		)
+	await gitOrThrow(
+		pi,
+		["merge", "--ff-only", branch],
+		`Failed to fast-forward canonical memory branch from ${branch}`,
+		{ cwd: canonicalWorkTree },
+	)
+}
+
+async function syncCanonicalBranchFromBare(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+): Promise<void> {
+	await fetchCanonicalBranchFromGitRemotes(pi, paths)
+	await fastForwardCanonicalBranchFromFetchedOrigin(pi, paths)
+}
+async function pushCanonicalBranchToBare(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+): Promise<void> {
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	const canonicalBranch = await getCurrentBranch(pi, canonicalWorkTree)
+	const remotes = await listGitRemotes(pi, canonicalWorkTree)
+	for (const remote of remotes) {
+		await pushCanonicalBranchToRemote(
+			pi,
+			canonicalWorkTree,
+			remote,
+			canonicalBranch,
+		)
+	}
+}
+
+async function hasGitChanges(
+	pi: ExtensionAPI,
+	workTree: string,
+): Promise<boolean> {
+	const status = await gitOrThrow(
+		pi,
+		["status", "--porcelain"],
+		`Failed to inspect git status for ${workTree}`,
+		{ cwd: workTree },
+	)
+	return status.stdout.trim().length > 0
+}
+async function commitWorktreeChanges(
+	pi: ExtensionAPI,
+	workTree: string,
+	message: string,
+	files?: string[],
+): Promise<void> {
+	const changedPaths = [...new Set((files ?? []).filter(Boolean))]
+	if (changedPaths.length > 0) {
+		await gitOrThrow(
+			pi,
+			["add", "--", ...changedPaths],
+			`Failed to stage memory changes in ${workTree}`,
+			{ cwd: workTree },
+		)
+	} else {
+		await gitOrThrow(
+			pi,
+			["add", "-A"],
+			`Failed to stage memory changes in ${workTree}`,
+			{ cwd: workTree },
+		)
+	}
+	if (!(await hasGitChanges(pi, workTree))) return
+	await ensureGitIdentity(pi, workTree)
+	await gitOrThrow(
+		pi,
+		["commit", "-m", message],
+		`Failed to commit memory changes in ${workTree}`,
+		{ cwd: workTree },
+	)
+}
+function toWorktreeRelativePaths(
+	paths: MemoryPaths,
+	files: string[],
+): string[] {
+	return files.map((file) => path.relative(paths.workTree, file))
+}
+function parseWorktreeList(
+	output: string,
+): Array<{ path: string; branch?: string; head?: string }> {
+	const worktrees: Array<{ path: string; branch?: string; head?: string }> = []
+	let current: { path: string; branch?: string; head?: string } | null = null
+	for (const line of output.split(/\r?\n/)) {
+		if (!line.trim()) {
+			if (current) worktrees.push(current)
+			current = null
+			continue
+		}
+		const [key, ...rest] = line.split(" ")
+		const value = rest.join(" ").trim()
+		if (key === "worktree") {
+			if (current) worktrees.push(current)
+			current = { path: value }
+			continue
+		}
+		if (!current) continue
+		if (key === "branch") current.branch = value.replace(/^refs\/heads\//, "")
+		if (key === "HEAD") current.head = value
+	}
+	if (current) worktrees.push(current)
+	return worktrees
+}
+async function listMemoryWorktrees(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+): Promise<Array<{ path: string; branch?: string; head?: string }>> {
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	if (!(await exists(canonicalWorkTree))) return []
+	const result = await gitOrThrow(
+		pi,
+		["worktree", "list", "--porcelain"],
+		`Failed to list memory worktrees for ${canonicalWorkTree}`,
+		{ cwd: canonicalWorkTree },
+	)
+	return parseWorktreeList(result.stdout)
+}
+async function hasGitWorkTreeFile(workTree: string): Promise<boolean> {
+	return exists(path.join(workTree, ".git"))
+}
+
+function normalizePathForCompare(filePath: string): string {
+	try {
+		return realpathSync(filePath)
+	} catch {
+		return path.resolve(filePath)
+	}
+}
+async function isRegisteredWorktree(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+	workTree: string,
+	branch?: string | null,
+): Promise<boolean> {
+	const target = normalizePathForCompare(workTree)
+	const worktrees = await listMemoryWorktrees(pi, paths)
+	return worktrees.some(
+		(entry) =>
+			normalizePathForCompare(entry.path) === target ||
+			(branch != null && entry.branch === branch),
+	)
+}
+async function waitForRegisteredWorktree(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+	workTree: string,
+	branch?: string | null,
+): Promise<boolean> {
+	for (let attempt = 0; attempt < WORKTREE_REGISTRATION_RETRIES; attempt++) {
+		if (
+			(await hasGitWorkTreeFile(workTree)) &&
+			(await isRegisteredWorktree(pi, paths, workTree, branch))
+		)
+			return true
+		await new Promise((resolve) => setTimeout(resolve, 50))
+	}
+	return false
+}
+async function getWorktreeDebugInfo(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+	workTree: string,
+	branch?: string | null,
+	lastAdd?: { stdout: string; stderr: string } | null,
+): Promise<string> {
+	const canonicalWorkTree = getCanonicalWorkTree(paths)
+	const [worktreeList, branchList] = await Promise.all([
+		git(pi, ["worktree", "list", "--porcelain"], {
+			cwd: canonicalWorkTree,
+		}).catch((error) => ({
+			stdout: "",
+			stderr: String(error),
+			code: 1,
+			killed: false,
+		})),
+		git(pi, ["branch", "-a", "-vv"], { cwd: canonicalWorkTree }).catch(
+			(error) => ({
+				stdout: "",
+				stderr: String(error),
+				code: 1,
+				killed: false,
+			}),
+		),
+	])
+	return [
+		`target_worktree: ${workTree}`,
+		`canonical_worktree: ${canonicalWorkTree}`,
+		`branch: ${branch ?? "<none>"}`,
+		"last_add_stderr:",
+		lastAdd?.stderr.trim() || "<empty>",
+		"worktree_list:",
+		worktreeList.stdout.trim() || worktreeList.stderr.trim() || "<empty>",
+		"branch_list:",
+		branchList.stdout.trim() || branchList.stderr.trim() || "<empty>",
+	].join("\n")
+}
+
+async function ensureMemoryWorktree(
+	pi: ExtensionAPI,
+	cwd: string,
+	paths: MemoryPaths,
+	worktreeKey: string,
+	created: string[],
+): Promise<MemoryPaths> {
+	if (worktreeKey === "main") return paths
+	const workTree = path.join(paths.worktreesDir, worktreeKey)
+	const branch = getWorktreeBranchName(worktreeKey)
+	const canonicalBranch = await getCurrentBranch(pi, paths.workTree)
+	let lastAdd: { stdout: string; stderr: string } | null = null
+
+	if (
+		(await exists(workTree)) &&
+		(!(await hasGitWorkTreeFile(workTree)) ||
+			!(await isRegisteredWorktree(pi, paths, workTree, branch)))
+	) {
+		await rm(workTree, { recursive: true, force: true })
+	}
+	if (!(await exists(workTree))) {
+		const pruneResult = await git(pi, ["worktree", "prune"], {
+			cwd: paths.workTree,
+		})
+		if (pruneResult.code !== 0)
+			throw new Error(
+				getGitFailureMessage(
+					`Failed to prune stale memory worktrees for ${paths.workTree}`,
+					["worktree", "prune"],
+					pruneResult,
+				),
+			)
+		if (branch && (await gitLocalBranchExists(pi, paths.workTree, branch))) {
+			lastAdd = await gitOrThrow(
+				pi,
+				["worktree", "add", "--force", workTree, branch],
+				`Failed to attach existing memory worktree branch ${branch}`,
+				{
+					cwd: paths.workTree,
+				},
+			)
+		} else if (branch) {
+			lastAdd = await gitOrThrow(
+				pi,
+				["worktree", "add", "--force", "-b", branch, workTree, canonicalBranch],
+				`Failed to create memory worktree branch ${branch}`,
+				{ cwd: paths.workTree },
+			)
+		} else {
+			lastAdd = await gitOrThrow(
+				pi,
+				["worktree", "add", "--force", workTree, canonicalBranch],
+				`Failed to attach memory worktree ${workTree}`,
+				{
+					cwd: paths.workTree,
+				},
+			)
+		}
+		created.push(workTree)
+	}
+	if (!(await waitForRegisteredWorktree(pi, paths, workTree, branch))) {
+		const debug = await getWorktreeDebugInfo(
+			pi,
+			paths,
+			workTree,
+			branch,
+			lastAdd,
+		)
+		await rm(workTree, { recursive: true, force: true })
+		throw new Error(
+			`Failed to create registered git worktree at ${workTree} for ${branch ?? canonicalBranch}\n\n${debug}`,
+		)
+	}
+	await ensureGitIdentity(pi, workTree)
+	return getPaths(cwd, path.basename(paths.agentDir), workTree)
+}
+async function deleteMemoryWorktree(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+	worktreeKey: string,
+): Promise<void> {
+	if (worktreeKey === "main")
+		throw new Error("The main worktree cannot be removed")
+	const workTree = path.join(paths.worktreesDir, worktreeKey)
+	const branch = getWorktreeBranchName(worktreeKey)
+	if (await exists(workTree))
+		await gitOrThrow(
+			pi,
+			["worktree", "remove", "--force", workTree],
+			`Failed to remove memory worktree ${workTree}`,
+			{ cwd: paths.workTree },
+		)
+	if (branch && (await gitLocalBranchExists(pi, paths.workTree, branch)))
+		await gitOrThrow(
+			pi,
+			["branch", "-D", branch],
+			`Failed to delete memory worktree branch ${branch}`,
+			{ cwd: paths.workTree },
+		)
+}
+async function deleteSessionWorktreeForAgent(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	agentId: string,
+): Promise<void> {
+	const worktreeKey = getSessionWorktreeKey(ctx)
+	if (worktreeKey === "main") return
+	const paths = getPaths(ctx.cwd, agentId)
+	const workTree = path.join(paths.worktreesDir, worktreeKey)
+	const branch = getWorktreeBranchName(worktreeKey)
+	if (!(await exists(paths.workTree))) return
+	if (
+		!(await exists(workTree)) &&
+		!(branch && (await gitLocalBranchExists(pi, paths.workTree, branch)))
+	)
+		return
+	await deleteMemoryWorktree(pi, paths, worktreeKey)
+}
+
 async function readJson<T>(filePath: string, fallback: T): Promise<T> {
 	try {
 		return JSON.parse(await readFile(filePath, "utf8")) as T
@@ -295,6 +1102,19 @@ function getMemoryItemIdsSync(cwd: string, agentId: string): string[] {
 	}
 	return [...ids].sort()
 }
+function getMemoryWorktreeKeysSync(cwd: string, agentId: string): string[] {
+	const paths = getPaths(cwd, agentId)
+	const keys = new Set(["main"])
+	if (!existsSync(paths.worktreesDir)) return [...keys]
+	for (const entry of readdirSync(paths.worktreesDir, {
+		withFileTypes: true,
+	})) {
+		if (!entry.isDirectory()) continue
+		keys.add(entry.name)
+	}
+	return [...keys].sort()
+}
+
 function getMemoryCommandCompletions(
 	prefix: string,
 ): AutocompleteItem[] | null {
@@ -302,49 +1122,47 @@ function getMemoryCommandCompletions(
 	const endsWithSpace = /\s$/.test(prefix)
 	const parts = trimmed.split(/\s+/).filter(Boolean)
 	const command = parts[0] ?? ""
-	const commands = ["list", "recent", "show", "grep", "update", "delete"]
+	const commands = [
+		"list",
+		"recent",
+		"show",
+		"history",
+		"grep",
+		"update",
+		"delete",
+		"sync",
+		"sync-strategy",
+		"worktrees",
+		"worktree-add",
+		"worktree-remove",
+	]
 	const memoryIds = getMemoryItemIdsSync(process.cwd(), getCurrentAgentIdSync())
+	const worktreeKeys = getMemoryWorktreeKeysSync(
+		process.cwd(),
+		getCurrentAgentIdSync(),
+	)
 	if (!trimmed) return commands.map((value) => ({ value, label: value }))
 	if (parts.length === 1 && !endsWithSpace)
 		return toAutocompleteItems(commands, command)
-	if (["show", "update", "delete"].includes(command)) {
+	if (["show", "history", "update", "delete"].includes(command)) {
 		const selectorPrefix = endsWithSpace ? "" : parts.slice(1).join(" ")
 		return toAutocompleteItems(memoryIds, selectorPrefix, `${command} `)
 	}
+	if (["worktree-add", "worktree-remove"].includes(command)) {
+		const selectorPrefix = endsWithSpace ? "" : parts.slice(1).join(" ")
+		return toAutocompleteItems(worktreeKeys, selectorPrefix, `${command} `)
+	}
+	if (command === "sync-strategy") {
+		const selectorPrefix = endsWithSpace ? "" : parts.slice(1).join(" ")
+		return toAutocompleteItems(
+			["ours", "theirs"],
+			selectorPrefix,
+			`${command} `,
+		)
+	}
 	return null
 }
-function getRuleFileIds(agentId: string, cwd: string): string[] {
-	const paths = getPaths(cwd, agentId)
-	if (!existsSync(paths.rulesDir)) return []
-	const files: string[] = []
-	const stack: Array<{ dir: string; relative: string }> = [
-		{ dir: paths.rulesDir, relative: "" },
-	]
-	while (stack.length > 0) {
-		const current = stack.pop()
-		if (!current) continue
-		for (const entry of readdirSync(current.dir, { withFileTypes: true })) {
-			const fullPath = path.join(current.dir, entry.name)
-			const relativePath = current.relative
-				? path.join(current.relative, entry.name)
-				: entry.name
-			if (entry.isDirectory()) {
-				stack.push({ dir: fullPath, relative: relativePath })
-				continue
-			}
-			if (entry.isFile() && entry.name.endsWith(".md")) files.push(relativePath)
-		}
-	}
 
-	return files.sort()
-}
-
-function getRulesCommandCompletions(prefix: string): AutocompleteItem[] | null {
-	return toAutocompleteItems(
-		getRuleFileIds(getCurrentAgentIdSync(), process.cwd()),
-		prefix,
-	)
-}
 function frontmatter(
 	fields: Record<string, string | number | string[]>,
 ): string {
@@ -453,6 +1271,7 @@ async function getRecentFiles(
 	const results: Array<{ file: string; mtimeMs: number }> = []
 	const entries = await readdir(dir, { withFileTypes: true })
 	for (const entry of entries) {
+		if (entry.name === ".git") continue
 		const fullPath = path.join(dir, entry.name)
 		if (entry.isDirectory()) {
 			results.push(...(await getRecentFiles(fullPath, limit)))
@@ -495,21 +1314,90 @@ async function ensureAgentLayout(
 	pi: ExtensionAPI,
 	cwd: string,
 	agentId: string,
+	worktreeKey: string = "main",
 ): Promise<EnsureResult> {
-	const paths = getPaths(cwd, agentId)
+	const basePaths = getPaths(cwd, agentId)
 	const created: string[] = []
-	for (const dir of [paths.root, paths.agentsDir, paths.agentDir]) {
+	for (const dir of [
+		basePaths.root,
+		basePaths.agentsDir,
+		basePaths.agentDir,
+		basePaths.worktreesDir,
+	]) {
 		await ensureDir(dir, created)
 	}
 
-	if (!(await exists(paths.bareRepo))) {
-		await pi.exec("git", ["init", "--bare", paths.bareRepo])
-		created.push(paths.bareRepo)
+	if (!(await exists(basePaths.bareRepo))) {
+		await gitOrThrow(
+			pi,
+			["init", "--bare", "--initial-branch=main", basePaths.bareRepo],
+			`Failed to initialize bare memory repo ${basePaths.bareRepo}`,
+		)
+		created.push(basePaths.bareRepo)
 	}
 
-	if (!(await exists(paths.workTree))) {
-		await pi.exec("git", ["clone", paths.bareRepo, paths.workTree], { cwd })
-		created.push(paths.workTree)
+	if (!(await exists(basePaths.workTree))) {
+		await gitOrThrow(
+			pi,
+			["clone", basePaths.bareRepo, basePaths.workTree],
+			`Failed to clone memory repo into ${basePaths.workTree}`,
+			{ cwd },
+		)
+		created.push(basePaths.workTree)
+	}
+	await ensureGitIdentity(pi, basePaths.workTree)
+	await syncCanonicalBranchFromBare(pi, basePaths)
+
+	for (const dir of [
+		basePaths.profileDir,
+		basePaths.projectDir,
+		basePaths.projectFactsDir,
+		basePaths.sessionsDir,
+		basePaths.sessionMemoryDir,
+		basePaths.summariesDir,
+		basePaths.inboxDir,
+		basePaths.rulesDir,
+		basePaths.projectRulesDir,
+		basePaths.agentRulesDir,
+		basePaths.generatedRulesDir,
+		basePaths.agentNotesDir,
+	]) {
+		await ensureDir(dir, created)
+	}
+	for (const [filePath, content] of Object.entries(
+		getDefaultFiles(cwd, agentId, basePaths),
+	)) {
+		await ensureFile(filePath, content, created)
+	}
+
+	if (
+		!(await hasGitHead(pi, basePaths.workTree)) ||
+		(await hasGitChanges(pi, basePaths.workTree))
+	) {
+		await commitWorktreeChanges(
+			pi,
+			basePaths.workTree,
+			"chore(memory): initialize repo",
+		)
+		await pushCanonicalBranchToBare(pi, basePaths)
+	}
+
+	const paths = await ensureMemoryWorktree(
+		pi,
+		cwd,
+		basePaths,
+		worktreeKey,
+		created,
+	)
+	return { paths, created }
+}
+async function ensureWorktreeLayout(
+	cwd: string,
+	agentId: string,
+	paths: MemoryPaths,
+): Promise<void> {
+	if (!(await hasGitWorkTreeFile(paths.workTree))) {
+		throw new Error(`Refusing to populate non-git worktree: ${paths.workTree}`)
 	}
 	for (const dir of [
 		paths.profileDir,
@@ -525,90 +1413,46 @@ async function ensureAgentLayout(
 		paths.generatedRulesDir,
 		paths.agentNotesDir,
 	]) {
-		await ensureDir(dir, created)
+		await mkdir(dir, { recursive: true })
 	}
-
 	for (const [filePath, content] of Object.entries(
 		getDefaultFiles(cwd, agentId, paths),
 	)) {
-		await ensureFile(filePath, content, created)
+		if (await exists(filePath)) continue
+		await mkdir(path.dirname(filePath), { recursive: true })
+		await writeFile(filePath, content, "utf8")
 	}
-
-	return { paths, created }
 }
 
-async function appendTimeline(
-	paths: MemoryPaths,
-	entry: Record<string, unknown>,
-): Promise<void> {
-	await appendFile(paths.timelineFile, `${JSON.stringify(entry)}\n`, "utf8")
-}
-
-async function appendCandidates(
-	paths: MemoryPaths,
-	entry: Record<string, unknown>,
-): Promise<void> {
-	await appendFile(paths.candidatesFile, `${JSON.stringify(entry)}\n`, "utf8")
-}
-async function remember(
+async function resolveMutationPaths(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	agentId: string,
-	input: RememberInput,
-): Promise<string> {
-	const { paths } = await ensureAgentLayout(pi, ctx.cwd, agentId)
-	const now = new Date().toISOString()
-	const source =
-		input.source?.trim() || ctx.sessionManager.getSessionFile() || "ephemeral"
-	const dir = getRememberDir(paths, input.scope)
-	const stem = await getUniqueMemoryStem(
-		dir,
-		getMemoryTitle(input.text, input.kind),
-	)
-	const id = `${input.scope}/${stem}`
-	const filePath = path.join(dir, `${stem}.md`)
-	const content = `${frontmatter({
-		id,
-		scope: input.scope,
-		project: getProjectSlug(ctx.cwd),
-		agent: agentId,
-		kind: input.kind,
-		confidence: input.confidence.toFixed(2),
-		sources: [source],
-		created_at: now,
-		updated_at: now,
-	})}\n\n${input.text.trim()}\n`
-	await writeFile(filePath, content, "utf8")
-	await appendTimeline(paths, {
-		id,
-		timestamp: now,
-		action: "remember",
-		agent: agentId,
-		scope: input.scope,
-		kind: input.kind,
-		file: filePath,
-		source,
-	})
-	await appendCandidates(paths, {
-		id,
-		timestamp: now,
-		action: "remember",
-		agent: agentId,
-		scope: input.scope,
-		kind: input.kind,
-		confidence: input.confidence,
-		text: input.text.trim(),
-		file: filePath,
-		source,
-	})
-	return filePath
+): Promise<{ paths: MemoryPaths; worktreeKey: string; source: string }> {
+	const sessionId = ctx.sessionManager.getSessionId().trim()
+	const sessionFile = ctx.sessionManager.getSessionFile()
+	const source = sessionFile || sessionId || "ephemeral"
+	const worktreeKey = getSessionWorktreeKey(ctx)
+	const { paths } = await ensureAgentLayout(pi, ctx.cwd, agentId, worktreeKey)
+	await syncWorktreeWithCanonical(pi, paths, worktreeKey)
+	await ensureWorktreeLayout(ctx.cwd, agentId, paths)
+	return { paths, worktreeKey, source }
 }
-async function collectMemoryItems(
+async function resolveReadPaths(
 	pi: ExtensionAPI,
-	cwd: string,
+	ctx: ExtensionContext,
 	agentId: string,
+): Promise<MemoryPaths> {
+	const worktreeKey = getSessionWorktreeKey(ctx)
+	const { paths } = await ensureAgentLayout(pi, ctx.cwd, agentId, worktreeKey)
+	await syncWorktreeWithCanonical(pi, paths, worktreeKey)
+	await ensureWorktreeLayout(ctx.cwd, agentId, paths)
+	return paths
+}
+
+async function collectMemoryItemsFromPaths(
+	paths: MemoryPaths,
 ): Promise<MemoryItem[]> {
-	const { paths } = await ensureAgentLayout(pi, cwd, agentId)
 	const files = (
 		await Promise.all(
 			getMemoryRoots(paths).map(async ({ scope, dir }) => {
@@ -647,15 +1491,13 @@ async function collectMemoryItems(
 		),
 	)
 }
-async function findMemoryItem(
-	pi: ExtensionAPI,
-	cwd: string,
-	agentId: string,
+async function findMemoryItemInPaths(
+	paths: MemoryPaths,
 	selector: string,
 ): Promise<MemoryItem | null> {
 	const normalized = selector.trim()
 	if (!normalized) return null
-	const items = await collectMemoryItems(pi, cwd, agentId)
+	const items = await collectMemoryItemsFromPaths(paths)
 	return (
 		items.find(
 			(item) =>
@@ -670,6 +1512,90 @@ async function findMemoryItem(
 		null
 	)
 }
+
+async function appendTimeline(
+	paths: MemoryPaths,
+	entry: Record<string, unknown>,
+): Promise<void> {
+	await appendFile(paths.timelineFile, `${JSON.stringify(entry)}\n`, "utf8")
+}
+
+async function appendCandidates(
+	paths: MemoryPaths,
+	entry: Record<string, unknown>,
+): Promise<void> {
+	await appendFile(paths.candidatesFile, `${JSON.stringify(entry)}\n`, "utf8")
+}
+async function remember(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	agentId: string,
+	input: RememberInput,
+): Promise<string> {
+	const { paths, worktreeKey, source } = await resolveMutationPaths(
+		pi,
+		ctx,
+		agentId,
+	)
+	const now = new Date().toISOString()
+	const provenanceSource = input.source?.trim() || source
+	const dir = getRememberDir(paths, input.scope)
+	const stem = await getUniqueMemoryStem(
+		dir,
+		getMemoryTitle(input.text, input.kind),
+	)
+	const id = `${input.scope}/${stem}`
+	const filePath = path.join(dir, `${stem}.md`)
+	const content = `${frontmatter({
+		id,
+		scope: input.scope,
+		project: getProjectSlug(ctx.cwd),
+		agent: agentId,
+		kind: input.kind,
+		confidence: input.confidence.toFixed(2),
+		sources: [provenanceSource],
+		created_at: now,
+		updated_at: now,
+	})}\n\n${input.text.trim()}\n`
+	await writeFile(filePath, content, "utf8")
+	await appendTimeline(paths, {
+		id,
+		timestamp: now,
+		action: "remember",
+		agent: agentId,
+		scope: input.scope,
+		kind: input.kind,
+		file: filePath,
+		source: provenanceSource,
+	})
+	await appendCandidates(paths, {
+		id,
+		timestamp: now,
+		action: "remember",
+		agent: agentId,
+		scope: input.scope,
+		kind: input.kind,
+		confidence: input.confidence,
+		text: input.text.trim(),
+		file: filePath,
+		source: provenanceSource,
+	})
+	await commitWorktreeChanges(
+		pi,
+		paths.workTree,
+		`feat(memory): remember ${id}`,
+		toWorktreeRelativePaths(paths, [
+			filePath,
+			paths.timelineFile,
+			paths.candidatesFile,
+		]),
+	)
+	await fastForwardCanonicalBranch(pi, paths, worktreeKey)
+	await pushCanonicalBranchToBare(pi, paths)
+
+	return filePath
+}
+
 async function updateMemoryItem(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -678,19 +1604,20 @@ async function updateMemoryItem(
 	text: string,
 	options?: { mode?: "replace" | "append"; source?: string },
 ): Promise<MemoryItem> {
-	const item = await findMemoryItem(pi, ctx.cwd, agentId, selector)
+	const { paths, worktreeKey, source } = await resolveMutationPaths(
+		pi,
+		ctx,
+		agentId,
+	)
+	const item = await findMemoryItemInPaths(paths, selector)
 	if (!item) throw new Error(`Could not find memory item: ${selector}`)
-
-	const parsed = parseFrontmatterBlock(await readFile(item.filePath, "utf8"))
 	const now = new Date().toISOString()
-	const source =
-		options?.source?.trim() ||
-		ctx.sessionManager.getSessionFile() ||
-		"ephemeral"
+	const provenanceSource = options?.source?.trim() || source
+	const parsed = parseFrontmatterBlock(await readFile(item.filePath, "utf8"))
 	const sources = new Set(
 		Array.isArray(parsed.data.sources) ? parsed.data.sources : [],
 	)
-	sources.add(source)
+	sources.add(provenanceSource)
 	const nextBody =
 		options?.mode === "append"
 			? `${parsed.body.trim()}\n\n${text.trim()}`.trim()
@@ -722,7 +1649,6 @@ async function updateMemoryItem(
 		})}\n\n${nextBody}\n`,
 		"utf8",
 	)
-	const { paths } = await ensureAgentLayout(pi, ctx.cwd, agentId)
 	await appendTimeline(paths, {
 		id: item.id,
 		timestamp: now,
@@ -730,8 +1656,16 @@ async function updateMemoryItem(
 		agent: agentId,
 		file: item.filePath,
 		mode: options?.mode ?? "replace",
-		source,
+		source: provenanceSource,
 	})
+	await commitWorktreeChanges(
+		pi,
+		paths.workTree,
+		`docs(memory): update ${item.id}`,
+		toWorktreeRelativePaths(paths, [item.filePath, paths.timelineFile]),
+	)
+	await fastForwardCanonicalBranch(pi, paths, worktreeKey)
+	await pushCanonicalBranchToBare(pi, paths)
 
 	return {
 		...item,
@@ -740,25 +1674,65 @@ async function updateMemoryItem(
 		sources: [...sources],
 	}
 }
+
+async function getMemoryHistoryFromPaths(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
+	selector: string,
+	limit: number = 20,
+): Promise<string> {
+	const item = await findMemoryItemInPaths(paths, selector)
+	if (!item) throw new Error(`Could not find memory item: ${selector}`)
+	const relativePath = path.relative(paths.workTree, item.filePath)
+	const result = await gitOrThrow(
+		pi,
+		[
+			"log",
+			"--follow",
+			`--max-count=${limit}`,
+			"--date=iso-strict",
+			"--format=%H%x09%ad%x09%s",
+			"--",
+			relativePath,
+		],
+		`Failed to read git history for ${item.id}`,
+		{ cwd: paths.workTree },
+	)
+	const entries = result.stdout.trim().split(/\r?\n/).filter(Boolean)
+	if (entries.length === 0) return `No git history found for ${item.id}`
+	return [
+		`History for ${item.id}`,
+		`Path: ${item.filePath}`,
+		"",
+		...entries.map((line) => {
+			const [commit, date, subject] = line.split("\t")
+			return `- ${date} ${commit.slice(0, 12)} ${subject}`
+		}),
+	].join("\n")
+}
 async function deleteMemoryItem(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	agentId: string,
 	selector: string,
 ): Promise<MemoryItem> {
-	const item = await findMemoryItem(pi, ctx.cwd, agentId, selector)
+	const { paths, worktreeKey, source } = await resolveMutationPaths(
+		pi,
+		ctx,
+		agentId,
+	)
+	const item = await findMemoryItemInPaths(paths, selector)
 	if (!item) throw new Error(`Could not find memory item: ${selector}`)
 	await unlink(item.filePath)
-	const { paths } = await ensureAgentLayout(pi, ctx.cwd, agentId)
 	const now = new Date().toISOString()
-	const source = ctx.sessionManager.getSessionFile() || "ephemeral"
+	const provenanceSource = source
 	await appendTimeline(paths, {
 		id: item.id,
 		timestamp: now,
 		action: "delete",
 		agent: agentId,
 		file: item.filePath,
-		source,
+		source: provenanceSource,
 	})
 	await appendCandidates(paths, {
 		id: item.id,
@@ -766,8 +1740,21 @@ async function deleteMemoryItem(
 		action: "delete",
 		agent: agentId,
 		file: item.filePath,
-		source,
+		source: provenanceSource,
 	})
+	await commitWorktreeChanges(
+		pi,
+		paths.workTree,
+		`chore(memory): delete ${item.id}`,
+		toWorktreeRelativePaths(paths, [
+			item.filePath,
+			paths.timelineFile,
+			paths.candidatesFile,
+		]),
+	)
+	await fastForwardCanonicalBranch(pi, paths, worktreeKey)
+	await pushCanonicalBranchToBare(pi, paths)
+
 	return item
 }
 function renderMemoryItem(item: MemoryItem): string {
@@ -793,14 +1780,51 @@ function renderMemoryList(items: MemoryItem[], limit: number = 20): string {
 		)
 		.join("\n")
 }
-async function grepMemory(
+async function renderMemoryOverview(
 	pi: ExtensionAPI,
 	cwd: string,
 	agentId: string,
+): Promise<string> {
+	const { paths } = await ensureAgentLayout(pi, cwd, agentId)
+	const recentFiles = await getRecentFiles(paths.workTree, 8)
+	const rules = await collectMarkdownFiles(paths.rulesDir)
+	const worktrees = await listMemoryWorktrees(pi, paths)
+	const syncStatus = await renderSyncStatus(pi, paths)
+	return [
+		`Agent: ${agentId}`,
+		`Memory root: ${paths.workTree}`,
+		`Canonical worktree: ${getCanonicalWorkTree(paths)}`,
+		`Canonical repo: ${paths.bareRepo}`,
+		`Project summary: ${paths.projectSummaryFile}`,
+		`Latest summary: ${paths.latestSummaryFile}`,
+		`Rules: ${rules.length}`,
+		`Worktrees: ${worktrees.length}`,
+		...syncStatus,
+		"",
+		"Attached worktrees:",
+		...(worktrees.length > 0
+			? worktrees.map(
+					(worktree) =>
+						`- ${worktree.path}${worktree.branch ? ` [${worktree.branch}]` : " [detached]"}`,
+				)
+			: ["- No worktrees found"]),
+		"",
+		"Recent files:",
+		...(recentFiles.length > 0
+			? recentFiles.map((item) => `- ${item.file}`)
+			: ["- No memory files yet"]),
+	].join("\n")
+}
+async function readFileIfPresent(filePath: string): Promise<string | null> {
+	if (!(await exists(filePath))) return null
+	return readFile(filePath, "utf8")
+}
+async function grepMemoryInPaths(
+	pi: ExtensionAPI,
+	paths: MemoryPaths,
 	query: string,
 	limit: number = 30,
 ): Promise<string> {
-	const { paths } = await ensureAgentLayout(pi, cwd, agentId)
 	const grepRoots = [
 		paths.projectDir,
 		paths.profileDir,
@@ -842,31 +1866,6 @@ async function grepMemory(
 			return "No matches found"
 		throw error
 	}
-}
-async function renderMemoryOverview(
-	pi: ExtensionAPI,
-	cwd: string,
-	agentId: string,
-): Promise<string> {
-	const { paths } = await ensureAgentLayout(pi, cwd, agentId)
-	const recentFiles = await getRecentFiles(paths.workTree, 8)
-	const rules = await collectMarkdownFiles(paths.rulesDir)
-	return [
-		`Agent: ${agentId}`,
-		`Memory root: ${paths.workTree}`,
-		`Project summary: ${paths.projectSummaryFile}`,
-		`Latest summary: ${paths.latestSummaryFile}`,
-		`Rules: ${rules.length}`,
-		"",
-		"Recent files:",
-		...(recentFiles.length > 0
-			? recentFiles.map((item) => `- ${item.file}`)
-			: ["- No memory files yet"]),
-	].join("\n")
-}
-async function readFileIfPresent(filePath: string): Promise<string | null> {
-	if (!(await exists(filePath))) return null
-	return readFile(filePath, "utf8")
 }
 async function buildInjectedContext(
 	pi: ExtensionAPI,
@@ -930,13 +1929,26 @@ function parseMemoryArgs(args: string): {
 	const trimmed = args.trim()
 	if (!trimmed) return { command: "list" }
 	const [command, ...rest] = trimmed.split(/\s+/)
-	if (command === "show" || command === "delete")
+	if (
+		command === "show" ||
+		command === "history" ||
+		command === "delete" ||
+		command === "worktree-add" ||
+		command === "worktree-remove" ||
+		command === "sync-strategy"
+	)
 		return { command, selector: rest.join(" ") || undefined }
 	if (command === "update")
 		return { command, selector: rest[0], text: rest.slice(1).join(" ") }
 	if (command === "grep" || command === "search")
 		return { command: "grep", text: rest.join(" ") }
-	if (command === "list" || command === "recent") return { command }
+	if (
+		command === "list" ||
+		command === "recent" ||
+		command === "worktrees" ||
+		command === "sync"
+	)
+		return { command }
 	return { command: "grep", text: trimmed }
 }
 export default function piettaExtension(pi: ExtensionAPI) {
@@ -957,6 +1969,21 @@ export default function piettaExtension(pi: ExtensionAPI) {
 			EXTENSION_NAME,
 			ctx.ui.theme.fg("accent", `pietta:${currentAgentId}`),
 		)
+	})
+	pi.on("session_shutdown", async (_event, ctx) => {
+		await syncState()
+		const agentIds = new Set([...getAgentIds(), currentAgentId])
+		for (const agentId of agentIds) {
+			try {
+				await deleteSessionWorktreeForAgent(pi, ctx, agentId)
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error)
+				ctx.ui.notify(
+					`Failed to clean up Pietta session worktree for ${agentId}: ${message}`,
+					"warning",
+				)
+			}
+		}
 	})
 	pi.on("before_agent_start", async (_event, ctx) => {
 		await syncState()
@@ -1040,17 +2067,15 @@ export default function piettaExtension(pi: ExtensionAPI) {
 		},
 	})
 	pi.registerCommand("memory", {
-		description: "Inspect, show, grep, update, or delete Pietta memory",
+		description: "Inspect, show, grep, sync, update, or delete Pietta memory",
 		getArgumentCompletions: getMemoryCommandCompletions,
 		handler: async (args, ctx) => {
 			await syncState()
 			const parsed = parseMemoryArgs(args)
 			if (parsed.command === "list" || parsed.command === "recent") {
+				const paths = await resolveReadPaths(pi, ctx, currentAgentId)
 				ctx.ui.notify(
-					renderMemoryList(
-						await collectMemoryItems(pi, ctx.cwd, currentAgentId),
-						20,
-					),
+					renderMemoryList(await collectMemoryItemsFromPaths(paths), 20),
 					"info",
 				)
 				return
@@ -1060,12 +2085,8 @@ export default function piettaExtension(pi: ExtensionAPI) {
 					ctx.ui.notify("Usage: /memory show <id>", "warning")
 					return
 				}
-				const item = await findMemoryItem(
-					pi,
-					ctx.cwd,
-					currentAgentId,
-					parsed.selector,
-				)
+				const paths = await resolveReadPaths(pi, ctx, currentAgentId)
+				const item = await findMemoryItemInPaths(paths, parsed.selector)
 				ctx.ui.notify(
 					item
 						? renderMemoryItem(item)
@@ -1074,6 +2095,20 @@ export default function piettaExtension(pi: ExtensionAPI) {
 				)
 				return
 			}
+
+			if (parsed.command === "history") {
+				if (!parsed.selector) {
+					ctx.ui.notify("Usage: /memory history <id>", "warning")
+					return
+				}
+				const paths = await resolveReadPaths(pi, ctx, currentAgentId)
+				ctx.ui.notify(
+					await getMemoryHistoryFromPaths(pi, paths, parsed.selector, 20),
+					"info",
+				)
+				return
+			}
+
 			if (parsed.command === "update") {
 				if (!parsed.selector) {
 					ctx.ui.notify("Usage: /memory update <id> [text]", "warning")
@@ -1116,6 +2151,88 @@ export default function piettaExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`Deleted ${deleted.id}\n${deleted.filePath}`, "info")
 				return
 			}
+
+			if (parsed.command === "sync") {
+				const { paths } = await ensureAgentLayout(pi, ctx.cwd, currentAgentId)
+				await reconcileCanonicalBranchWithGitRemotes(pi, paths)
+				await pushCanonicalBranchToBare(pi, paths)
+				ctx.ui.notify(
+					[
+						"Pietta sync complete",
+						"",
+						...(await renderSyncStatus(pi, paths)),
+					].join("\n"),
+					"info",
+				)
+				return
+			}
+			if (parsed.command === "sync-strategy") {
+				const { paths } = await ensureAgentLayout(pi, ctx.cwd, currentAgentId)
+				const canonicalWorkTree = getCanonicalWorkTree(paths)
+				if (!parsed.selector) {
+					const strategy = await getConflictResolutionStrategy(
+						pi,
+						canonicalWorkTree,
+					)
+					ctx.ui.notify(`Pietta sync strategy: ${strategy}`, "info")
+					return
+				}
+				if (parsed.selector !== "ours" && parsed.selector !== "theirs") {
+					ctx.ui.notify("Usage: /memory sync-strategy <ours|theirs>", "warning")
+					return
+				}
+				await setConflictResolutionStrategy(
+					pi,
+					canonicalWorkTree,
+					parsed.selector,
+				)
+				ctx.ui.notify(`Set Pietta sync strategy to ${parsed.selector}`, "info")
+				return
+			}
+			if (parsed.command === "worktrees") {
+				const { paths } = await ensureAgentLayout(pi, ctx.cwd, currentAgentId)
+				const worktrees = await listMemoryWorktrees(pi, paths)
+				ctx.ui.notify(
+					worktrees.length > 0
+						? worktrees
+								.map(
+									(worktree) =>
+										`- ${worktree.path}${worktree.branch ? ` [${worktree.branch}]` : " [detached]"}`,
+								)
+								.join("\n")
+						: "No worktrees found",
+					"info",
+				)
+				return
+			}
+			if (parsed.command === "worktree-add") {
+				if (!parsed.selector) {
+					ctx.ui.notify("Usage: /memory worktree-add <name>", "warning")
+					return
+				}
+				const worktreeKey = slugifyWorktreeKey(parsed.selector)
+				const basePaths = getPaths(ctx.cwd, currentAgentId)
+				await ensureAgentLayout(pi, ctx.cwd, currentAgentId, worktreeKey)
+				ctx.ui.notify(
+					`Attached worktree ${worktreeKey} at ${path.join(basePaths.worktreesDir, worktreeKey)}`,
+					"info",
+				)
+				return
+			}
+			if (parsed.command === "worktree-remove") {
+				if (!parsed.selector) {
+					ctx.ui.notify("Usage: /memory worktree-remove <name>", "warning")
+					return
+				}
+				const worktreeKey = slugifyWorktreeKey(parsed.selector)
+				await deleteMemoryWorktree(
+					pi,
+					getPaths(ctx.cwd, currentAgentId),
+					worktreeKey,
+				)
+				ctx.ui.notify(`Removed worktree ${worktreeKey}`, "info")
+				return
+			}
 			if (parsed.command === "grep") {
 				const query = parsed.text?.trim() || ""
 				if (!query) {
@@ -1125,14 +2242,12 @@ export default function piettaExtension(pi: ExtensionAPI) {
 					)
 					return
 				}
-				ctx.ui.notify(
-					await grepMemory(pi, ctx.cwd, currentAgentId, query, 50),
-					"info",
-				)
+				const paths = await resolveReadPaths(pi, ctx, currentAgentId)
+				ctx.ui.notify(await grepMemoryInPaths(pi, paths, query, 50), "info")
 				return
 			}
 			ctx.ui.notify(
-				"Usage: /memory <list|recent|show|grep|update|delete>",
+				"Usage: /memory <list|recent|show|history|grep|update|delete|sync|sync-strategy|worktrees>",
 				"warning",
 			)
 		},
@@ -1205,20 +2320,20 @@ export default function piettaExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			await syncState()
 			const agentId = sanitizeAgentId(params.agentId || currentAgentId)
+			const paths = await resolveReadPaths(pi, ctx, agentId)
 			return {
 				content: [
 					{
 						type: "text",
-						text: await grepMemory(
+						text: await grepMemoryInPaths(
 							pi,
-							ctx.cwd,
-							agentId,
+							paths,
 							params.query,
 							params.limit ?? 30,
 						),
 					},
 				],
-				details: { agentId, query: params.query },
+				details: { agentId, query: params.query, workTree: paths.workTree },
 			}
 		},
 	})
