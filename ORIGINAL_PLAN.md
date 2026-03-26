@@ -222,8 +222,8 @@ Required capabilities:
 Suggested commands:
 Memory lifecycle and inspection:
 
-- `/init` — deep memory initialization for the current agent and project
-- `/doctor` — audit and refine memory structure without full re-init
+- `/pietta-init` — deep memory initialization for the current agent and project
+- `/pietta-doctor` — audit and refine memory structure without full re-init
 - `/remember [text]` — explicitly promote something into memory
 - `/memory` — inspect memory, recent entries, and provenance
 - `/search` — search messages, prior conversations, memory files, and rule files
@@ -244,7 +244,7 @@ Parallel agent execution can happen through separate Pi processes rather than a 
 After reviewing Letta Code's slash command docs, the most relevant commands for Pietta's design are:
 
 - `/agents` — Letta treats agents as first-class objects, which strongly supports Pietta's multi-agent design
-- `/init`, `/doctor`, `/remember`, `/memory` — Letta has an explicit memory lifecycle, not just passive retrieval
+- `/pietta-init`, `/pietta-doctor`, `/remember`, `/memory` — Letta has an explicit memory lifecycle, not just passive retrieval
 - `/search` - Letta separates message search from memory inspection, which Pietta should preserve, and Pietta should let agents search prior conversations beyond the current session
 - `/pin`, `/unpin`, `/rename`, `/description`, `/export` — agent identity and portability matter in long-lived systems
 - oh-my-pi's rules system / TTSR-style just-in-time injection is also a strong cue: Pietta should support rule files that activate only when relevant, instead of bloating base context

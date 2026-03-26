@@ -133,9 +133,9 @@ It deliberately does **not** grep other projects in the same agent repo.
 
 Current command surface:
 
-- `/init` — initialize Pietta for the current or selected agent
+- `/pietta-init` — initialize Pietta for the current or selected agent
 - `/agent` — switch the active Pietta agent
-- `/doctor` — audit and repair memory layout
+- `/pietta-doctor` — audit and repair memory layout
 - `/remember` — store a durable memory item
 - `/memory list`
 - `/memory recent`
@@ -172,7 +172,7 @@ Pietta now persists memory changes as real git commits inside each agent memory 
 
 Mutating and session-scoped read operations now automatically use a per-session linked worktree when a Pi session id or session file is available. Session worktrees live under `~/.pi/pietta/agents/<agent-id>/worktrees/` and use named branches like `pietta/session/<session-key>` instead of detached HEADs.
 
-Before a session mutation, Pietta rebases that session branch onto the canonical branch. After the commit is created, Pietta fast-forwards the canonical branch to include the session commit. `/doctor` reports the attached worktrees so concurrent session state is visible and easy to audit.
+Before a session mutation, Pietta rebases that session branch onto the canonical branch. After the commit is created, Pietta fast-forwards the canonical branch to include the session commit. `/pietta-doctor` reports the attached worktrees so concurrent session state is visible and easy to audit.
 If the canonical memory repo has additional git remotes configured, Pietta fetches them automatically before reads and mutations. On read paths, Pietta only fast-forwards the canonical branch from `origin` when that update is a clean fast-forward, and it does not merge other remotes. On mutation paths and `/memory sync`, Pietta also merges remote changes into the canonical branch using the configured sync strategy and pushes local commits back out. If a push is rejected as non-fast-forward, Pietta fetches, auto-merges the remote branch, and retries the push.
 
 Sync strategy is configurable with `/memory sync-strategy <ours|theirs>` and stored in git config as `pietta.syncStrategy`. The default is `theirs`.
@@ -188,14 +188,14 @@ git -C ~/.pi/pietta/agents/<agent-id>/memory remote add <name> <url>
 git -C ~/.pi/pietta/agents/<agent-id>/memory fetch <name>
 ```
 
-`origin` is the local bare repo managed by Pietta. Additional remotes are fetched automatically, shown in `/doctor`, included in `/memory sync`, and pushed to after successful canonical updates.
+`origin` is the local bare repo managed by Pietta. Additional remotes are fetched automatically, shown in `/pietta-doctor`, included in `/memory sync`, and pushed to after successful canonical updates.
 
 ### Seeding Pietta from an existing remote repo
 
 One simple way to start from an existing remote memory repo is:
 
 ```bash
-pi /init
+pi /pietta-init
 cd ~/.pi/pietta/agents/<agent-id>/memory
 git remote add upstream <url>
 git fetch upstream
@@ -233,7 +233,7 @@ Implemented now:
 - per-agent git-backed repo layout
 - real git commits for memory writes, updates, and deletes
 - automatic per-session worktrees for concurrent mutations
-- attached worktree visibility in `/doctor`
+- attached worktree visibility in `/pietta-doctor`
 - scoped durable memory writing
 - meaningful memory filenames
 - memory grep

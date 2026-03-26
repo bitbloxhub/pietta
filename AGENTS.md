@@ -76,9 +76,9 @@ Treat it like ripgrep:
 
 Other important commands:
 
-- `/init`
+- `/pietta-init`
 - `/agent`
-- `/doctor`
+- `/pietta-doctor`
 - `/remember`
 - `/memory ...`
 - `/rules`

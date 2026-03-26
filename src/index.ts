@@ -1997,7 +1997,7 @@ export default function piettaExtension(pi: ExtensionAPI) {
 			},
 		}
 	})
-	pi.registerCommand("init", {
+	pi.registerCommand("pietta-init", {
 		description: "Initialize Pietta memory for the current or selected agent",
 		getArgumentCompletions: (prefix) =>
 			toAutocompleteItems(getAgentIds(), prefix),
@@ -2030,7 +2030,7 @@ export default function piettaExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`Switched Pietta agent to ${agentId}`, "info")
 		},
 	})
-	pi.registerCommand("doctor", {
+	pi.registerCommand("pietta-doctor", {
 		description: "Audit and repair Pietta memory layout",
 		getArgumentCompletions: (prefix) =>
 			toAutocompleteItems(getAgentIds(), prefix),
