@@ -58,8 +58,8 @@ export function getPaths(
 	const mainWorkTree = path.join(agentDir, "memory")
 	const workTree = workTreeOverride ?? mainWorkTree
 	const projectDir = path.join(workTree, "projects", getProjectSlug(cwd))
+	const systemDir = path.join(workTree, "system")
 	const rulesDir = path.join(workTree, "rules")
-
 	return {
 		root,
 		stateFile: path.join(root, "state.json"),
@@ -68,10 +68,11 @@ export function getPaths(
 		bareRepo: path.join(agentDir, "memory.git"),
 		workTree,
 		worktreesDir: path.join(agentDir, "worktrees"),
-		profileDir: path.join(workTree, "profile"),
+		systemDir,
+		projectsDir: path.join(workTree, "projects"),
 		projectDir,
-		projectFactsDir: path.join(projectDir, "facts"),
-		projectSummaryFile: path.join(projectDir, "SUMMARY.md"),
+		projectSystemDir: path.join(projectDir, "system"),
+		projectSummaryFile: path.join(projectDir, "README.md"),
 		projectDecisionsFile: path.join(projectDir, "decisions.md"),
 		timelineFile: path.join(projectDir, "timeline.jsonl"),
 		scratchpadFile: path.join(projectDir, "scratchpad.md"),
@@ -81,11 +82,11 @@ export function getPaths(
 		latestSummaryFile: path.join(workTree, "summaries", "latest.md"),
 		inboxDir: path.join(workTree, "inbox"),
 		candidatesFile: path.join(workTree, "inbox", "candidates.jsonl"),
+		archiveDir: path.join(workTree, "archive"),
 		rulesDir,
-		projectRulesDir: path.join(rulesDir, "project"),
+		projectRulesDir: path.join(projectDir, "rules"),
 		agentRulesDir: path.join(rulesDir, "agent"),
 		generatedRulesDir: path.join(rulesDir, "generated"),
-		agentNotesDir: path.join(workTree, "agent"),
 	}
 }
 

@@ -10,6 +10,10 @@ import {
 	renderSyncStatus,
 	setConflictResolutionStrategy,
 } from "../core/git.js"
+import {
+	buildPiettaInitCommandPrompt,
+	buildRememberCommandPrompt,
+} from "../core/intelligence.js"
 import { ensureAgentLayout, resolveReadPaths } from "../core/layout.js"
 import {
 	collectMemoryItemsFromPaths,
@@ -17,7 +21,6 @@ import {
 	findMemoryItemInPaths,
 	getMemoryHistoryFromPaths,
 	grepMemoryInPaths,
-	remember,
 	renderMemoryItem,
 	renderMemoryList,
 	renderMemoryOverview,
@@ -48,18 +51,23 @@ export function registerCommands(
 	setCurrentAgent: (agentId: string) => Promise<void>,
 ) {
 	pi.registerCommand("pietta-init", {
-		description: "Initialize Pietta memory for the current or selected agent",
+		description:
+			"Initialize or re-analyze Pietta memory for the current or selected agent",
 		getArgumentCompletions: (prefix) =>
 			toAutocompleteItems(getAgentIds(), prefix),
 		handler: async (args, ctx) => {
 			await syncState()
 			const agentId = sanitizeAgentId(args || getCurrentAgentId())
-			const result = await ensureAgentLayout(pi, ctx.cwd, agentId)
+			await ensureAgentLayout(pi, ctx.cwd, agentId)
 			await setCurrentAgent(agentId)
+			const prompt = buildPiettaInitCommandPrompt()
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(prompt)
+				return
+			}
+			pi.sendUserMessage(prompt, { deliverAs: "followUp" })
 			ctx.ui.notify(
-				result.created.length > 0
-					? `Initialized Pietta for ${agentId} (${result.created.length} paths created)`
-					: `Pietta already initialized for ${agentId}`,
+				`Queued /pietta-init as a follow-up user message for ${agentId}`,
 				"info",
 			)
 		},
@@ -98,25 +106,18 @@ export function registerCommands(
 	})
 
 	pi.registerCommand("remember", {
-		description: "Store a durable Pietta memory entry",
+		description: "Send a Letta-style memory request to the agent",
 		getArgumentCompletions: getRememberCompletions,
 		handler: async (args, ctx) => {
 			await syncState()
 			const remembered = parseRememberArgs(args)
-			let text = remembered.text
-			if (!text)
-				text = (await ctx.ui.editor("Remember what?", ""))?.trim() || ""
-			if (!text) {
-				ctx.ui.notify("Nothing to remember", "warning")
+			const prompt = buildRememberCommandPrompt(remembered)
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(prompt)
 				return
 			}
-			const filePath = await remember(pi, ctx, getCurrentAgentId(), {
-				text,
-				scope: remembered.scope,
-				kind: "fact",
-				confidence: 0.9,
-			})
-			ctx.ui.notify(`Remembered in ${filePath}`, "info")
+			pi.sendUserMessage(prompt, { deliverAs: "followUp" })
+			ctx.ui.notify("Queued /remember as a follow-up user message", "info")
 		},
 	})
 
