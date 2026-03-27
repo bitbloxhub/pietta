@@ -11,6 +11,7 @@ import {
 	type MemoryArgs,
 	type RememberArgs,
 	type Scope,
+	type SleeptimeArgs,
 } from "../core/types.js"
 
 export function toAutocompleteItems(
@@ -44,6 +45,15 @@ export function getAgentsCommandCompletions(
 		return toAutocompleteItems(agents, selectorPrefix, `${command} `)
 	}
 	return null
+}
+
+export function getSleeptimeCompletions(
+	prefix: string,
+): AutocompleteItem[] | null {
+	const trimmed = prefix.trimStart()
+	const commands = ["status", "debug", "on", "off", "compaction"]
+	if (!trimmed) return commands.map((value) => ({ value, label: value }))
+	return toAutocompleteItems(commands, trimmed)
 }
 
 export function getRememberCompletions(
@@ -182,6 +192,11 @@ export function parseMemoryArgs(args: string): MemoryArgs {
 	)
 		return { command }
 	return { command: "grep", text: trimmed }
+}
+
+export function parseSleeptimeArgs(args: string): SleeptimeArgs {
+	const command = args.trim().toLowerCase() || "status"
+	return { command }
 }
 
 export function normalizeAgentArg(

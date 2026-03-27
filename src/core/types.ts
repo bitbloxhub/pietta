@@ -1,7 +1,17 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent"
 export type Scope = "project" | "agent" | "session"
+export type ReflectionTrigger = "off" | "compaction"
+export type ReflectionStatus = "idle" | "success" | "skipped" | "error"
 export type PiettaState = {
 	currentAgentId: string
+}
+export type ReflectionConfig = {
+	trigger: ReflectionTrigger
+	lastReflectionKey?: string
+	lastReflectionAt?: string
+	lastReflectionStatus?: ReflectionStatus
+	lastReflectionMessage?: string
+	lastReflectionDebug?: string
 }
 export type MemoryPaths = {
 	root: string
@@ -57,11 +67,10 @@ export type GitResult = {
 	code: number
 	killed: boolean
 }
-
 export type SyncConflictStrategy = "ours" | "theirs"
-
 export const EXTENSION_NAME = "pietta"
 export const DEFAULT_AGENT_ID = "default"
+export const DEFAULT_REFLECTION_TRIGGER: ReflectionTrigger = "compaction"
 export const SCOPE_VALUES = ["project", "agent", "session"] as const
 export const WORKTREE_REGISTRATION_RETRIES = 5
 export type AgentsArgs = {
@@ -73,7 +82,9 @@ export type MemoryArgs = {
 	selector?: string
 	text?: string
 }
-
+export type SleeptimeArgs = {
+	command: string
+}
 export type RememberArgs = {
 	scope: Scope
 	scopeExplicit: boolean

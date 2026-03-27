@@ -5,6 +5,7 @@ import type {
 import { buildInjectedContext } from "./core/context.js"
 import { ensureAgentLayout } from "./core/layout.js"
 import { sanitizeAgentId } from "./core/paths.js"
+import { runSleepTimeReflectionForCompaction } from "./core/reflection.js"
 import {
 	loadState,
 	loadStateFromSession,
@@ -83,6 +84,22 @@ export default function piettaExtension(pi: ExtensionAPI) {
 				"warning",
 			)
 		}
+	})
+	pi.on("session_before_compact", async (event, ctx) => {
+		await syncState(ctx)
+		await runSleepTimeReflectionForCompaction(
+			pi,
+			ctx,
+			currentAgentId,
+			event.preparation,
+			event.branchEntries,
+		).catch((error) => {
+			const message = error instanceof Error ? error.message : String(error)
+			ctx.ui.notify(
+				`Pietta sleep-time reflection failed: ${message}`,
+				"warning",
+			)
+		})
 	})
 	pi.on("before_agent_start", async (_event, ctx) => {
 		await syncState(ctx)
