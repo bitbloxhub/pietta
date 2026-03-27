@@ -35,15 +35,21 @@ import {
 	sanitizeAgentId,
 	slugifyWorktreeKey,
 } from "../core/paths.js"
-import { getAgentIds } from "../core/state.js"
+import {
+	getAgentIds,
+	loadReflectionConfig,
+	saveReflectionConfig,
+} from "../core/state.js"
 import { EXTENSION_NAME } from "../core/types.js"
 import {
 	getAgentsCommandCompletions,
 	getMemoryCommandCompletions,
 	getRememberCompletions,
+	getSleeptimeCompletions,
 	parseAgentsArgs,
 	parseMemoryArgs,
 	parseRememberArgs,
+	parseSleeptimeArgs,
 	toAutocompleteItems,
 } from "./parsing.js"
 
@@ -121,6 +127,72 @@ export function registerCommands(
 			}
 			pi.sendUserMessage(prompt, { deliverAs: "followUp" })
 			ctx.ui.notify("Queued /remember as a follow-up user message", "info")
+		},
+	})
+
+	pi.registerCommand("sleeptime", {
+		description: "Configure Pietta sleep-time reflection",
+		getArgumentCompletions: getSleeptimeCompletions,
+		handler: async (args, ctx) => {
+			await syncState(ctx)
+			const currentAgentId = getCurrentAgentId()
+			const parsed = parseSleeptimeArgs(args)
+			const current = await loadReflectionConfig(currentAgentId)
+			if (parsed.command === "status") {
+				ctx.ui.notify(
+					[
+						`Pietta sleep-time reflection for ${currentAgentId}`,
+						`Trigger: ${current.trigger}`,
+						`Last status: ${current.lastReflectionStatus ?? "idle"}`,
+						`Last run: ${current.lastReflectionAt ?? "never"}`,
+						`Last message: ${current.lastReflectionMessage ?? "none"}`,
+					].join("\n"),
+					"info",
+				)
+				return
+			}
+			if (parsed.command === "debug") {
+				ctx.ui.notify(
+					[
+						`Pietta sleep-time reflection debug for ${currentAgentId}`,
+						`Trigger: ${current.trigger}`,
+						`Last status: ${current.lastReflectionStatus ?? "idle"}`,
+						`Last run: ${current.lastReflectionAt ?? "never"}`,
+						`Last message: ${current.lastReflectionMessage ?? "none"}`,
+						"",
+						"--- Debug ---",
+						current.lastReflectionDebug ?? "No reflection debug captured yet.",
+					].join("\n"),
+					"info",
+				)
+				return
+			}
+			if (parsed.command === "on" || parsed.command === "compaction") {
+				await saveReflectionConfig(currentAgentId, {
+					...current,
+					trigger: "compaction",
+				})
+				ctx.ui.notify(
+					`Enabled Pietta sleep-time reflection on compaction for ${currentAgentId}`,
+					"info",
+				)
+				return
+			}
+			if (parsed.command === "off") {
+				await saveReflectionConfig(currentAgentId, {
+					...current,
+					trigger: "off",
+				})
+				ctx.ui.notify(
+					`Disabled Pietta sleep-time reflection for ${currentAgentId}`,
+					"info",
+				)
+				return
+			}
+			ctx.ui.notify(
+				"Usage: /sleeptime <status|debug|on|off|compaction>",
+				"warning",
+			)
 		},
 	})
 
