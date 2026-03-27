@@ -90,7 +90,6 @@ export async function buildInjectedContext(
 		`- session root: ${paths.sessionMemoryDir}`,
 		`- shared rules root: ${paths.rulesDir}`,
 		`- project rules root: ${paths.projectRulesDir}`,
-		`- inbox root: ${paths.inboxDir}`,
 	]
 	if (projectSummary) blocks.push(`## Project Summary\n${projectSummary}`)
 	if (latestSummary && latestSummary !== EMPTY_LATEST_SUMMARY)

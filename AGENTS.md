@@ -31,7 +31,6 @@ Important subdirectories:
 - `agent/`
 - `sessions/memory/`
 - `summaries/`
-- `inbox/`
 - `rules/project/`
 - `rules/agent/`
 - `rules/generated/`

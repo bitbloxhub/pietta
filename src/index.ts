@@ -5,7 +5,12 @@ import type {
 import { buildInjectedContext } from "./core/context.js"
 import { ensureAgentLayout } from "./core/layout.js"
 import { sanitizeAgentId } from "./core/paths.js"
-import { loadState, loadStateFromSession, saveState, saveStateToSession } from "./core/state.js"
+import {
+	loadState,
+	loadStateFromSession,
+	saveState,
+	saveStateToSession,
+} from "./core/state.js"
 import { DEFAULT_AGENT_ID, EXTENSION_NAME } from "./core/types.js"
 import { registerCommands } from "./commands/register.js"
 import { registerTools } from "./tools/register.js"

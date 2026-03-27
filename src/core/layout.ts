@@ -48,7 +48,7 @@ export function getDefaultFiles(
 	const now = new Date().toISOString()
 	return {
 		[path.join(paths.workTree, "README.md")]:
-			`# Pietta Memory\n\nThis git-backed worktree stores durable memory for agent \`${agentId}\`.\n\n## Hierarchy\n\n- \`system/\` is pinned high-priority memory, but Pietta does not prescribe fixed subfolders inside it\n- \`projects/<slug>/\` is project-scoped memory, and Pietta does not prescribe fixed subfolders there either\n- \`sessions/\`, \`rules/\`, \`inbox/\`, and \`archive/\` hold supporting memory and maintenance data\n`,
+			`# Pietta Memory\n\nThis git-backed worktree stores durable memory for agent \`${agentId}\`.\n\n## Hierarchy\n\n- \`system/\` is pinned high-priority memory, but Pietta does not prescribe fixed subfolders inside it\n- \`projects/<slug>/\` is project-scoped memory, and Pietta does not prescribe fixed subfolders there either\n- \`sessions/\`, \`rules/\`, and \`archive/\` hold supporting memory and maintenance data\n`,
 		[path.join(paths.systemDir, "README.md")]:
 			`# System Memory\n\nPinned high-priority memory. Organize this however the agent decides.\n`,
 		[path.join(paths.projectSystemDir, "README.md")]:
@@ -56,7 +56,6 @@ export function getDefaultFiles(
 		[paths.projectSummaryFile]: `# ${projectSlug}\n\nProject-scoped memory. Organize this however the agent decides.\n\n- Initialized: ${now}\n- Agent: ${agentId}\n`,
 		[paths.timelineFile]: "",
 		[paths.latestSummaryFile]: `# Latest Summary\n\nNo generated summary yet.\n`,
-		[paths.candidatesFile]: "",
 		[path.join(paths.projectRulesDir, "README.md")]: "# Project Rules\n\n",
 		[path.join(paths.agentRulesDir, "README.md")]: "# Agent Rules\n\n",
 		[path.join(paths.generatedRulesDir, "README.md")]: "# Generated Rules\n\n",
@@ -76,7 +75,6 @@ export function getManagedDirectories(paths: MemoryPaths): string[] {
 		paths.sessionsDir,
 		paths.sessionMemoryDir,
 		paths.summariesDir,
-		paths.inboxDir,
 		paths.archiveDir,
 		paths.rulesDir,
 		paths.projectRulesDir,

@@ -80,8 +80,6 @@ export function getPaths(
 		sessionMemoryDir: path.join(workTree, "sessions", "memory"),
 		summariesDir: path.join(workTree, "summaries"),
 		latestSummaryFile: path.join(workTree, "summaries", "latest.md"),
-		inboxDir: path.join(workTree, "inbox"),
-		candidatesFile: path.join(workTree, "inbox", "candidates.jsonl"),
 		archiveDir: path.join(workTree, "archive"),
 		rulesDir,
 		projectRulesDir: path.join(projectDir, "rules"),

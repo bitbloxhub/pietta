@@ -41,8 +41,6 @@ For an agent named `default`, Pietta now prefers a simpler top-level hierarchy:
     │   └── memory/
     ├── summaries/
     │   └── latest.md
-    ├── inbox/
-    │   └── candidates.jsonl
     ├── rules/
     │   ├── agent/
     │   └── generated/
@@ -125,7 +123,7 @@ Pietta injects a hidden context block that now emphasizes hierarchy:
 - the current agent id
 - the memory root path
 - memory discipline guidance
-- the active hierarchy roots (`system/`, project, project system, session, rules, inbox)
+- the active hierarchy roots (`system/`, project, project system, session, rules, archive)
 - the current project summary, if present
 - the latest summary, if present
 - pinned `system/` and project system memory snippets when available
@@ -145,7 +143,6 @@ Current grep scope is limited to the active project and shared agent areas for t
 - shared `rulesDir` (`rules/agent/` and `rules/generated/`)
 - `sessionMemoryDir`
 - `summariesDir`
-- `inboxDir`
 
 ## Slash commands
 

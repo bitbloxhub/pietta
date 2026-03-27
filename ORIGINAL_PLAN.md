@@ -106,8 +106,6 @@ Each agent gets its own canonical repo. Shared memory should not blur ownership 
 │       │   └── <session-id>.jsonl
 │       ├── summaries/
 │       │   └── latest.md
-│       ├── inbox/
-│       │   └── candidates.jsonl
 │       ├── archive/
 │       │   └── ...
 │       └── rules/

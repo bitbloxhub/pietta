@@ -23,8 +23,6 @@ export type MemoryPaths = {
 	sessionMemoryDir: string
 	summariesDir: string
 	latestSummaryFile: string
-	inboxDir: string
-	candidatesFile: string
 	archiveDir: string
 	rulesDir: string
 	projectRulesDir: string

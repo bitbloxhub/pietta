@@ -420,13 +420,6 @@ export async function appendTimeline(
 	await appendFile(paths.timelineFile, `${JSON.stringify(entry)}\n`, "utf8")
 }
 
-export async function appendCandidates(
-	paths: MemoryPaths,
-	entry: Record<string, unknown>,
-): Promise<void> {
-	await appendFile(paths.candidatesFile, `${JSON.stringify(entry)}\n`, "utf8")
-}
-
 export async function remember(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -468,16 +461,6 @@ ${input.text.trim()}
 			agent: agentId,
 			scope: input.scope,
 			kind: input.kind,
-			file: filePath,
-			source: provenanceSource,
-		})
-		await appendCandidates(paths, {
-			id,
-			timestamp: now,
-			action: "remember",
-			agent: agentId,
-			scope: input.scope,
-			kind: input.kind,
 			confidence: input.confidence,
 			text: input.text.trim(),
 			file: filePath,
@@ -487,11 +470,7 @@ ${input.text.trim()}
 			pi,
 			paths.workTree,
 			`feat(memory): remember ${id}`,
-			toWorktreeRelativePaths(paths, [
-				filePath,
-				paths.timelineFile,
-				paths.candidatesFile,
-			]),
+			toWorktreeRelativePaths(paths, [filePath, paths.timelineFile]),
 		)
 		await fastForwardCanonicalBranch(pi, paths, worktreeKey)
 		await pushCanonicalBranchToBare(pi, paths)
@@ -644,23 +623,11 @@ export async function deleteMemoryItem(
 			file: item.filePath,
 			source: provenanceSource,
 		})
-		await appendCandidates(paths, {
-			id: item.id,
-			timestamp: now,
-			action: "delete",
-			agent: agentId,
-			file: item.filePath,
-			source: provenanceSource,
-		})
 		await commitWorktreeChanges(
 			pi,
 			paths.workTree,
 			`chore(memory): delete ${item.id}`,
-			toWorktreeRelativePaths(paths, [
-				item.filePath,
-				paths.timelineFile,
-				paths.candidatesFile,
-			]),
+			toWorktreeRelativePaths(paths, [item.filePath, paths.timelineFile]),
 		)
 		await fastForwardCanonicalBranch(pi, paths, worktreeKey)
 		await pushCanonicalBranchToBare(pi, paths)
@@ -720,7 +687,6 @@ export async function renderMemoryOverview(
 		`- system/ (pinned): ${paths.systemDir}`,
 		`- projects/<slug>/: ${paths.projectDir}`,
 		`- sessions/: ${paths.sessionsDir}`,
-		`- inbox/: ${paths.inboxDir}`,
 		`- archive/: ${paths.archiveDir}`,
 		"",
 		`Project summary: ${paths.projectSummaryFile}`,
@@ -780,7 +746,6 @@ export async function grepMemoryInPaths(
 		paths.rulesDir,
 		paths.sessionMemoryDir,
 		paths.summariesDir,
-		paths.inboxDir,
 	])
 	try {
 		const result = await pi.exec("rg", [
