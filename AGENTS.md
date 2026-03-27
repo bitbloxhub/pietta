@@ -128,6 +128,8 @@ When editing existing files in this repo:
 - prefer small, surgical changes
 - keep command/tool wording aligned with current behavior
 - keep grep terminology consistent: use “grep” for the slash command path and “ripgrep-style” for behavior
+- run `pnpm check` after code changes to catch TypeScript errors, including unused locals and unused parameters
+- use `pnpm format` when you need to apply the repo formatter, and `pnpm check:format` to verify formatting
 
 ## Code layout
 

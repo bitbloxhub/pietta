@@ -10,7 +10,7 @@
 		"memory"
 	],
 	"scripts": {
-		"check": "tsc --noEmit",
+		"check": "tsc --noEmit --noUnusedLocals --noUnusedParameters",
 		"check:format": "prettier --check .",
 		"dev": "pnpm exec tsc --noEmit --watch",
 		"format": "prettier --write ."
