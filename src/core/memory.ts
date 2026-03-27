@@ -71,9 +71,6 @@ export function getRuleRoots(paths: MemoryPaths): string[] {
 	return uniquePaths([paths.projectRulesDir, paths.rulesDir])
 }
 
-export function getPinnedSystemRoots(paths: MemoryPaths): string[] {
-	return uniquePaths([paths.systemDir, paths.projectSystemDir])
-}
 export function getMemoryRoots(
 	paths: MemoryPaths,
 ): Array<{ scope: Scope; dir: string }> {
@@ -726,14 +723,6 @@ export async function readFirstPresentFile(
 	return null
 }
 
-export async function collectMarkdownFilesFromRoots(
-	roots: string[],
-): Promise<string[]> {
-	const files = (
-		await Promise.all(roots.map((root) => collectMarkdownFiles(root)))
-	).flat()
-	return [...new Set(files)].sort()
-}
 export async function grepMemoryInPaths(
 	pi: ExtensionAPI,
 	paths: MemoryPaths,

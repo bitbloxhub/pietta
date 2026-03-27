@@ -1,4 +1,3 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent"
 export type Scope = "project" | "agent" | "session"
 export type ReflectionTrigger = "off" | "compaction"
 export type ReflectionStatus = "idle" | "success" | "skipped" | "error"
@@ -96,4 +95,3 @@ export type MutationPathsResult = {
 	worktreeKey: string
 	source: string
 }
-export type SessionWorktreeResolver = (ctx: ExtensionContext) => string

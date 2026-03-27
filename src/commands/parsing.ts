@@ -3,7 +3,6 @@ import {
 	getMemoryItemIdsSync,
 	getMemoryWorktreeKeysSync,
 } from "../core/memory.js"
-import { sanitizeAgentId } from "../core/paths.js"
 import { getAgentIds, getCurrentAgentIdSync } from "../core/state.js"
 import {
 	SCOPE_VALUES,
@@ -197,11 +196,4 @@ export function parseMemoryArgs(args: string): MemoryArgs {
 export function parseSleeptimeArgs(args: string): SleeptimeArgs {
 	const command = args.trim().toLowerCase() || "status"
 	return { command }
-}
-
-export function normalizeAgentArg(
-	args: string,
-	currentAgentId: string,
-): string {
-	return sanitizeAgentId(args || currentAgentId)
 }
