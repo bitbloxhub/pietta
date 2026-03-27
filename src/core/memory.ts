@@ -750,20 +750,45 @@ export async function grepMemoryInPaths(
 	try {
 		const result = await pi.exec("rg", [
 			"--hidden",
-			"--line-number",
 			"--smart-case",
 			"--glob",
 			"!.git",
 			"--glob",
 			"!node_modules",
+			"--glob",
+			"*.md",
+			"--files-with-matches",
 			"--max-count",
-			String(limit),
+			"1",
 			query,
 			...grepRoots,
 		])
-		const combined =
-			[result.stdout, result.stderr].filter(Boolean).join("\n").trim() ||
-			"No matches found"
+		const matchedFiles = [
+			...new Set(
+				result.stdout
+					.split(/\r?\n/)
+					.map((line) => line.trim())
+					.filter(Boolean),
+			),
+		]
+		if (matchedFiles.length === 0) return "No matches found"
+		const selectedFiles = matchedFiles.slice(0, limit)
+		const blocks = await Promise.all(
+			selectedFiles.map(async (filePath) => {
+				const absolutePath = path.isAbsolute(filePath)
+					? filePath
+					: path.resolve(paths.workTree, filePath)
+				const relativePath =
+					path.relative(paths.workTree, absolutePath) || absolutePath
+				const content = await readFile(absolutePath, "utf8")
+				return [`--- ${relativePath} ---`, content.trim() || "(empty)"].join(
+					"\n",
+				)
+			}),
+		)
+		const combined = [`Matched files: ${matchedFiles.length}`, ...blocks].join(
+			"\n\n",
+		)
 		const truncation = truncateHead(combined, {
 			maxBytes: DEFAULT_MAX_BYTES,
 			maxLines: DEFAULT_MAX_LINES,

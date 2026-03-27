@@ -20,12 +20,14 @@ export function registerTools(
 		name: "pietta_grep_memory",
 		label: "Pietta Grep Memory",
 		description:
-			"Search Pietta memory files for the current agent exactly like ripgrep, including regex patterns",
+			"Search Pietta markdown memory with ripgrep-style text or regex and return the full contents of each matching file",
 		promptSnippet:
-			"Use pietta_grep_memory like ripgrep: pass plain text or regex directly to search durable notes, preferences, rules, and prior decisions",
+			"Use pietta_grep_memory like ripgrep: pass plain text or regex directly to find matching durable notes, preferences, rules, and prior decisions, then inspect the full matching files it returns",
 		promptGuidelines: [
 			"Use this tool exactly like ripgrep: pass the search pattern directly as the query.",
 			"The query can be plain text or a regular expression, just like rg.",
+			"This tool returns full matching markdown files, not line snippets.",
+			"It does not search timeline jsonl files.",
 			"Always use this tool instead of guessing when the user asks what you remember, asks about prior preferences, or asks you to recall earlier durable context.",
 			"Use this tool before guessing about prior project preferences, rules, or decisions.",
 		],
@@ -39,7 +41,7 @@ export function registerTools(
 			),
 			limit: Type.Optional(
 				Type.Number({
-					description: "Maximum matches to return",
+					description: "Maximum matching files to return",
 					minimum: 1,
 					maximum: 200,
 				}),
