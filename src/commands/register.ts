@@ -1,5 +1,5 @@
 import path from "node:path"
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent"
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent"
 import {
 	deleteMemoryWorktree,
 	deleteSessionWorktreeForAgent,
@@ -47,8 +47,8 @@ import {
 export function registerCommands(
 	pi: ExtensionAPI,
 	getCurrentAgentId: () => string,
-	syncState: () => Promise<void>,
-	setCurrentAgent: (agentId: string) => Promise<void>,
+	syncState: (ctx?: ExtensionContext) => Promise<void>,
+	setCurrentAgent: (agentId: string, ctx?: ExtensionContext) => Promise<void>,
 ) {
 	pi.registerCommand("pietta-init", {
 		description:
@@ -56,10 +56,10 @@ export function registerCommands(
 		getArgumentCompletions: (prefix) =>
 			toAutocompleteItems(getAgentIds(), prefix),
 		handler: async (args, ctx) => {
-			await syncState()
+			await syncState(ctx)
 			const agentId = sanitizeAgentId(args || getCurrentAgentId())
 			await ensureAgentLayout(pi, ctx.cwd, agentId)
-			await setCurrentAgent(agentId)
+			await setCurrentAgent(agentId, ctx)
 			const prompt = buildPiettaInitCommandPrompt()
 			if (ctx.isIdle()) {
 				pi.sendUserMessage(prompt)
@@ -78,10 +78,10 @@ export function registerCommands(
 		getArgumentCompletions: (prefix) =>
 			toAutocompleteItems(getAgentIds(), prefix),
 		handler: async (args, ctx) => {
-			await syncState()
+			await syncState(ctx)
 			const agentId = sanitizeAgentId(args)
 			await ensureAgentLayout(pi, ctx.cwd, agentId)
-			await setCurrentAgent(agentId)
+			await setCurrentAgent(agentId, ctx)
 			ctx.ui.setStatus(
 				EXTENSION_NAME,
 				ctx.ui.theme.fg("accent", `pietta:${agentId}`),
@@ -310,7 +310,7 @@ export function registerCommands(
 		description: "List, add, or switch Pietta agents",
 		getArgumentCompletions: getAgentsCommandCompletions,
 		handler: async (args, ctx) => {
-			await syncState()
+			await syncState(ctx)
 			const parsed = parseAgentsArgs(args)
 			if (parsed.command === "add" && parsed.value) {
 				const agentId = sanitizeAgentId(parsed.value)
@@ -324,7 +324,7 @@ export function registerCommands(
 			) {
 				const agentId = sanitizeAgentId(parsed.value)
 				await ensureAgentLayout(pi, ctx.cwd, agentId)
-				await setCurrentAgent(agentId)
+				await setCurrentAgent(agentId, ctx)
 				ctx.ui.setStatus(
 					EXTENSION_NAME,
 					ctx.ui.theme.fg("accent", `pietta:${agentId}`),
