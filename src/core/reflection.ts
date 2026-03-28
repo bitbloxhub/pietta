@@ -22,33 +22,12 @@ import { getProjectSlug } from "./paths.js"
 import { loadReflectionConfig, updateReflectionStatus } from "./state.js"
 import type { MemoryItem, Scope } from "./types.js"
 
-type ModelRegistryLike = {
-	getApiKey?: (model: { provider: string }) => Promise<string | undefined>
-	authStorage?: {
-		getApiKey?: (providerId: string) => Promise<string | undefined>
-	}
-}
-
 type ReflectionCompactionPreparation = {
 	firstKeptEntryId: string
 	tokensBefore: number
 	messagesToSummarize: Parameters<typeof convertToLlm>[0]
 	turnPrefixMessages: Parameters<typeof convertToLlm>[0]
 	previousSummary?: string
-}
-
-async function resolveModelApiKey(
-	ctx: ExtensionContext,
-): Promise<string | undefined> {
-	if (!ctx.model) return undefined
-	const modelRegistry = ctx.modelRegistry as unknown as ModelRegistryLike
-	if (typeof modelRegistry.getApiKey === "function") {
-		return modelRegistry.getApiKey(ctx.model)
-	}
-	if (typeof modelRegistry.authStorage?.getApiKey === "function") {
-		return modelRegistry.authStorage.getApiKey(ctx.model.provider)
-	}
-	return undefined
 }
 
 type ReflectionCandidate = {
@@ -117,7 +96,8 @@ async function completeReflectionPlan(
 	rawOutput: string
 }> {
 	if (!ctx.model) return { plan: null, rawText: "", rawOutput: "" }
-	const apiKey = await resolveModelApiKey(ctx)
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model)
+	if (!auth.ok) throw new Error(auth.error)
 
 	let currentPrompt = prompt
 	let lastText = ""
@@ -140,7 +120,8 @@ async function completeReflectionPlan(
 			},
 			{
 				reasoningEffort: "medium",
-				...(apiKey ? { apiKey } : {}),
+				apiKey: auth.apiKey,
+				headers: auth.headers,
 			},
 		)
 		lastOutput = JSON.stringify(response, null, 2)
